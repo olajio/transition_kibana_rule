@@ -1,0 +1,137 @@
+{
+  "kibana_threshold_alerts": {
+    "aliases": {},
+    "mappings": {
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "cloud_account_name": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "current_value": {
+          "type": "float"
+        },
+        "event_type": {
+          "type": "keyword"
+        },
+        "host": {
+          "properties": {
+            "hostname": {
+              "type": "keyword"
+            }
+          }
+        },
+        "kubernetes_labels_team": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "labels": {
+          "properties": {
+            "app_code": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            },
+            "client_code": {
+              "type": "keyword"
+            }
+          }
+        },
+        "message": {
+          "type": "text"
+        },
+        "service_name": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "threshold": {
+          "type": "float"
+        },
+        "ticket_priority": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "trace": {
+          "properties": {
+            "id": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            }
+          }
+        },
+        "transaction": {
+          "properties": {
+            "id": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            }
+          }
+        },
+        "volumeName": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        }
+      }
+    },
+    "settings": {
+      "index": {
+        "routing": {
+          "allocation": {
+            "include": {
+              "_tier_preference": "data_content"
+            }
+          }
+        },
+        "number_of_shards": "1",
+        "provided_name": "kibana_threshold_alerts",
+        "creation_date": "1762858677788",
+        "number_of_replicas": "1",
+        "uuid": "um73uqBiSkW60hD2b1fzqQ",
+        "version": {
+          "created": "8536000"
+        }
+      }
+    }
+  }
+}

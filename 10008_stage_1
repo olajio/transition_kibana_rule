@@ -1,0 +1,71 @@
+PUT kbn:/api/alerting/rule/5f632adf-f466-482c-bcbd-30ab3bc47e5b
+{
+  "name": "ITSMA Test 10008 - System CPU Utilization > 98% Stage 1",
+  "tags": [
+    "ITSMA",
+    "Test",
+    "Threshold rule",
+    "10008",
+    "Stage 1"
+  ],
+  "schedule": {
+    "interval": "4m"
+  },
+  "params": {
+    "searchType": "esqlQuery",
+    "timeWindowSize": 4,
+    "timeWindowUnit": "m",
+    "threshold": [
+      0
+    ],
+    "thresholdComparator": ">",
+    "size": 100,
+    "esqlQuery": {
+      "esql": "FROM prod:metricbeat-*\r\n| WHERE event.dataset: \"system.cpu\" AND @timestamp > NOW() - 4 minutes\r\n| STATS avg_cpu = AVG(system.cpu.total.norm.pct) * 100 BY host.hostname, labels.client_code, labels.app_code\r\n| WHERE avg_cpu > 98\r\n| LIMIT 10000\r\n"
+    },
+    "aggType": "count",
+    "groupBy": "row",
+    "termSize": 5,
+    "sourceFields": [],
+    "timeField": "@timestamp",
+    "excludeHitsFromPreviousRun": true
+  },
+  "artifacts": {
+    "dashboards": [],
+    "investigation_guide": {
+      "blob": ""
+    }
+  },
+  "actions": [
+    {
+      "group": "query matched",
+      "id": "2a05e29f-aaaf-40cd-a3e1-bf7da30311ac",
+      "params": {
+        "documents": [
+          {
+            "current_value": "{{context.hits.0._source.avg_cpu}}",
+            "threshold": "98",
+            "host": {
+              "hostname": "{{context.hits.0._source.host.hostname}}"
+            },
+            "labels": {
+              "client_code": "{{context.hits.0._source.labels.client_code}}",
+              "app_code": "{{context.hits.0._source.labels.app_code}}"
+            },
+            "event_type": "10008",
+            "@timestamp": "{{context.date}}"
+          }
+        ]
+      },
+      "frequency": {
+        "notify_when": "onActiveAlert",
+        "throttle": null,
+        "summary": false
+      },
+      "uuid": "38450a0d-855f-471e-9fb2-89db132db812"
+    }
+  ],
+  "alert_delay": {
+    "active": 1
+  }
+}
