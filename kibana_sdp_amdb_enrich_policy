@@ -1,0 +1,52 @@
+# Enrich policy over the LOCAL kibana_sdp_amdb, for the ENRICH variant of the
+# consolidated rule (10008_single_stage_enrich_variant).
+#
+# Run this on the LOCAL / CCS cluster -- the same cluster Kibana and
+# kibana_sdp_amdb already live on. Nothing is needed on prod: the rule uses
+# ENRICH _coordinator:, which forces the enrich to execute on the coordinating
+# (local) cluster, so the policy only has to exist here.
+#
+# match_field is hostname.keyword, not hostname: in kibana_sdp_amdb, hostname is
+# mapped as text with a .keyword subfield, and an enrich match_field has to be a
+# keyword. The rule matches it against host.hostname from metricbeat, which is
+# already keyword, so the types line up.
+#
+# enrich_fields is deliberately just the two the rule filters on. Enrich adds its
+# fields as new columns and same-named columns get overwritten, so keeping the
+# list narrow removes any chance of shadowing a metricbeat column.
+
+PUT _enrich/policy/kibana_sdp_amdb_policy
+{
+  "match": {
+    "indices": "kibana_sdp_amdb",
+    "match_field": "hostname.keyword",
+    "enrich_fields": [
+      "group",
+      "alert_status"
+    ]
+  }
+}
+
+# An enrich policy is a POINT-IN-TIME SNAPSHOT. It does nothing until executed,
+# and it does not track later changes to kibana_sdp_amdb -- this is the main
+# functional difference from LOOKUP JOIN, which always reads the live index.
+# Execute it once now:
+
+PUT _enrich/policy/kibana_sdp_amdb_policy/_execute
+
+# ...and re-execute it whenever AMDB config changes (a host is added, or an
+# alert is enabled/disabled for a host). Until you do, the rule keeps filtering
+# against the config as it was at the last execution: newly enabled hosts will
+# not alert, and newly disabled hosts will keep alerting. Wire the re-execution
+# into whatever maintains kibana_sdp_amdb, or schedule it (hourly/daily is
+# plenty for config that changes rarely) -- do not leave it manual.
+#
+# Inspect the policy and confirm it has been executed:
+
+GET _enrich/policy/kibana_sdp_amdb_policy
+GET _enrich/_stats
+
+# Executing a policy builds a hidden .enrich-* system index; it is rebuilt on
+# each execution and the old one is cleaned up. To remove the policy entirely:
+#
+#   DELETE _enrich/policy/kibana_sdp_amdb_policy

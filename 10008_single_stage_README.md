@@ -38,23 +38,69 @@ Two 9.3 constraints shape the query, and both are load-bearing:
    coordinator-side `ENRICH`.** So the join has to happen on the raw metric documents,
    **before** the aggregation — the reverse of the Stage 1 / Stage 2 order.
 
-## The consolidated query
+## Two ways to do this on 9.3
+
+`kibana_sdp_amdb` currently exists **only on the local/CCS cluster**, not on `prod`. That is
+the deciding fact, because a 9.3 remote `LOOKUP JOIN` joins against each queried cluster's own
+copy of the lookup index. So there are exactly two routes, and both are provided here:
+
+| | `10008_single_stage` (LOOKUP JOIN) | `10008_single_stage_enrich_variant` (ENRICH) |
+|---|---|---|
+| Needs on `prod` | `kibana_sdp_amdb` as a lookup-mode index | **nothing** |
+| Needs on local | nothing new | an enrich policy, executed |
+| Config freshness | **live** — reads the index every run | snapshot — stale until the policy is re-executed |
+| Join position | before `STATS`, on raw metric docs | after `STATS`, on breaching hosts only |
+| Work done | joins every metric doc in the window | joins a handful of rows |
+
+**Recommendation:** if you can get `kibana_sdp_amdb` onto `prod`, use the `LOOKUP JOIN` rule —
+it reads live config, which is the property the original design was chosen for ("your
+enrichment data changes frequently" is exactly the case for preferring `LOOKUP JOIN` over
+`ENRICH`). If you cannot, or not soon, the `ENRICH` variant is a genuine option that works
+today with no changes to `prod` at all, at the cost of having to re-execute the policy whenever
+AMDB config changes. Note the enrich route is also *cheaper*: because coordinator-mode `ENRICH`
+is not subject to the "no remote join after `STATS`" restriction, it can run after the
+aggregation and only enrich the breaching hosts, whereas the join has to run on every raw
+metric document in the window.
+
+Both emit a byte-identical event and both were verified the same way (see below).
+
+## The consolidated query (LOOKUP JOIN)
 
 ```esql
 FROM prod:metricbeat-*, prod:-metricbeat-7*
 | WHERE event.dataset == "system.cpu" AND @timestamp > NOW() - 5 minutes
-| EVAL metric_client_code = labels.client_code, metric_app_code = labels.app_code
 | RENAME host.hostname AS hostname.keyword
 | LOOKUP JOIN kibana_sdp_amdb ON hostname.keyword
 | MV_EXPAND group
 | WHERE group == "10008" AND alert_status == "enabled"
-| STATS avg_cpu = AVG(system.cpu.total.norm.pct) * 100 BY hostname.keyword, metric_client_code, metric_app_code
+| STATS avg_cpu = AVG(system.cpu.total.norm.pct) * 100 BY hostname.keyword, labels.client_code, labels.app_code
 | WHERE avg_cpu > 98
 | EVAL current_value = ROUND(avg_cpu, 2)
 | DROP avg_cpu
-| RENAME metric_client_code AS labels.client_code, metric_app_code AS labels.app_code
 | LIMIT 10000
 ```
+
+## The ENRICH variant
+
+```esql
+FROM prod:metricbeat-*, prod:-metricbeat-7*
+| WHERE event.dataset == "system.cpu" AND @timestamp > NOW() - 5 minutes
+| STATS avg_cpu = AVG(system.cpu.total.norm.pct) * 100 BY host.hostname, labels.client_code, labels.app_code
+| WHERE avg_cpu > 98
+| ENRICH _coordinator:kibana_sdp_amdb_policy ON host.hostname WITH group, alert_status
+| MV_EXPAND group
+| WHERE group == "10008" AND alert_status == "enabled"
+| EVAL current_value = ROUND(avg_cpu, 2)
+| RENAME host.hostname AS hostname.keyword
+| DROP avg_cpu
+| LIMIT 10000
+```
+
+`_coordinator` forces the enrich onto the local cluster, which is what makes this work with the
+policy only existing there. The trailing `RENAME` produces the same `hostname.keyword` column
+the action template reads, so the action is unchanged. The enrich policy's `match_field` must be
+`hostname.keyword` (see `kibana_sdp_amdb_enrich_policy`), because `hostname` is `text` in the
+config index and an enrich match field has to be a keyword.
 
 Line by line:
 
@@ -74,19 +120,34 @@ Line by line:
   Casting resolves the ambiguity as long as the only reference to the original field is the
   conversion itself. Note union-type casting is still a technical preview feature, which is
   why index exclusion is the primary approach here.
-- **`EVAL metric_client_code = …`, and the closing `RENAME`** — `client_code` / `app_code`
-  are plausible field names in an AMDB config index, and fields coming from the lookup index
-  **override** same-named columns on the left. Copying the two metricbeat values to
-  collision-proof names *before* the join, then renaming them back *after* the aggregation,
-  guarantees the ticket carries the app/client code from the metric document and not from
-  `kibana_sdp_amdb`. If you have confirmed `kibana_sdp_amdb` has no such fields, these two
-  lines can be dropped and the `STATS` can group `BY hostname.keyword, labels.client_code,
-  labels.app_code` directly.
-- **`RENAME host.hostname AS hostname.keyword`** — unchanged from Stage 2. The join key has
-  to exist under the same name on both sides; in `kibana_sdp_amdb` the usable keyword field
-  is the `hostname.keyword` subfield, so the left side needs a column with that literal
-  name. `host.hostname` is `keyword` in metricbeat, the same type Stage 2 was joining from,
-  so join behaviour is identical.
+- **No collision guard is needed** — an earlier revision copied `labels.client_code` /
+  `labels.app_code` to prefixed names across the join, because fields from the lookup index
+  **override** same-named columns on the left and `client_code`/`app_code` looked like
+  plausible AMDB field names. The actual mapping settles it: `kibana_sdp_amdb` has **no
+  `labels.*` fields at all**. Its 51 join-visible columns are `alert_status`, `app_code`,
+  `client`, `datacenter`, `domain`, `event_type`, `group`, `hostname`, `maintenance.*`,
+  `node`, `os`, `query.*`, `record.*`, `script.*`, `svc-operator`, `svc-software-owner`,
+  `svc_operator`, `svc_software_owner`, `target`, `type` and their `.keyword` siblings. It
+  does have `app_code` and `client`, but those are different names from `labels.app_code` and
+  `labels.client_code`, and ES|QL columns are flat dotted names, so nothing is shadowed. The
+  guard was dropped and the `STATS` groups the metricbeat fields directly. The one genuine
+  overlap is `hostname.keyword` itself, which is the join key — same value on both sides, so
+  the override is a no-op.
+- **`RENAME host.hostname AS hostname.keyword`** — unchanged from Stage 2, and the mapping
+  confirms exactly why it is needed: `hostname` in `kibana_sdp_amdb` is `text` with a
+  `.keyword` subfield, so the only keyword-typed join key available on the lookup side is
+  `hostname.keyword`, and the left side must present a column with that literal name.
+  `host.hostname` is `keyword` in metricbeat, the same type Stage 2 joined from, so join
+  behaviour is identical.
+- **`group` and `alert_status` are both `text` with `.keyword` subfields.** The rule filters
+  on the `text` fields, exactly as Stage 2 does, so this is proven behaviour and was left
+  alone. If the join turns out to be slow, switching to `MV_EXPAND group.keyword` /
+  `WHERE group.keyword == "10008" AND alert_status.keyword == "enabled"` is the lever to try:
+  `.keyword` has doc values and can be pushed down, whereas filtering `text` means loading
+  from `_source`, and in this rule that filter now runs on raw metric documents rather than
+  on a handful of pre-aggregated rows. That is an unmeasured optimisation, so it is not
+  applied here — the `ENRICH` variant is the better answer if volume turns out to be a problem,
+  since it filters after the aggregation.
 - **`MV_EXPAND group`** — unchanged from Stage 2. `group` is a list in the config index and
   `WHERE group == "10008"` does not behave as intended on a multivalued field, so the list is
   expanded to one row per value first.
@@ -108,24 +169,23 @@ Line by line:
 
 ## Prerequisites before enabling
 
-1. **`kibana_sdp_amdb` must exist on the `prod` cluster**, with `index.mode: lookup`:
+**For the ENRICH variant:** just `kibana_sdp_amdb_enrich_policy` — create the policy and
+execute it on the local cluster. Nothing on `prod`. Skip to point 3.
 
-   ```console
-   # on the prod cluster
-   PUT kibana_sdp_amdb
-   {
-     "settings": { "index.mode": "lookup" },
-     "mappings": { ... same mapping as the local copy ... }
-   }
-   ```
+**For the LOOKUP JOIN rule:**
 
-   Verify with `GET kibana_sdp_amdb/_settings` on `prod` and confirm `index.mode` is
-   `lookup`. Indices in lookup mode are always single-sharded.
+1. **`kibana_sdp_amdb` must exist on the `prod` cluster** with `index.mode: lookup`.
+   `kibana_sdp_amdb_prod_lookup_index` has the ready-to-run request, with the join-relevant
+   fields typed to match the local copy, plus the sync options and their caveats. The short
+   version: reindex-from-remote or dual-write are the straightforward routes; CCR is
+   attractive but runs the wrong way round here (CCR pulls, so `prod` would be the follower
+   and would need the local cluster configured as a remote on `prod`, which the existing
+   local→`prod` CCS link does not give you).
 
-   For keeping it in sync, cross-cluster replication (already in use in this deployment) is
-   the natural mechanism, with the local index as leader — confirm the follower keeps
-   `index.mode: lookup`, since the join fails without it. A scheduled reindex/transform to
-   `prod` works too.
+   Only `hostname`, `group` and `alert_status` are actually read, so the copy does not need
+   the other ~45 AMDB fields — and keeping it narrow removes any chance of a config field
+   shadowing a metricbeat column. Verify with `GET kibana_sdp_amdb/_settings` on `prod`;
+   lookup-mode indices are always single-sharded.
 
 2. **Watch out for the silent-failure mode.** Remote clusters default to
    `skip_unavailable: true`, which means a cluster is marked `skipped` — rather than failing
@@ -186,14 +246,39 @@ Worth knowing before the cutover — none of these are bugs, but they are change
 
 ## Files
 
-- `10008_single_stage` — Dev Tools console request. **`POST`**, not `PUT`: this creates a new
-  rule, and `rule_type_id` / `consumer` are only accepted on create (they are immutable
-  afterwards, and the `PUT` update API rejects them — which is why the existing
-  `10008_stage_1` / `10008_stage_2` files, being updates to already-created rules, use `PUT`).
+- `10008_single_stage` — the LOOKUP JOIN rule, as a Dev Tools console request. **`POST`**, not
+  `PUT`: this creates a new rule, and `rule_type_id` / `consumer` are only accepted on create
+  (they are immutable afterwards, and the `PUT` update API rejects them — which is why the
+  existing `10008_stage_1` / `10008_stage_2` files, being updates to already-created rules,
+  use `PUT`).
 - `10008_single_stage.ndjson` — same rule as a Saved Objects import
   (*Stack Management → Saved Objects → Import*). Imported disabled (`enabled: false`); it
   references the existing connector `69fdac41-8a5e-483d-a506-19660d8550eb`
   ("ITSMA Test Kibana Alerts Final connector"), which must already be present.
+- `kibana_sdp_amdb_prod_lookup_index` — creates the lookup-mode copy on `prod`, with sync
+  options and caveats. Only needed for the LOOKUP JOIN rule.
+- `10008_single_stage_enrich_variant` — the alternative rule that needs nothing on `prod`.
+- `kibana_sdp_amdb_enrich_policy` — the enrich policy that variant depends on, including the
+  re-execution requirement. Only needed for the ENRICH variant.
+
+Pick one rule or the other; they emit the same event to the same connector, so running both
+enabled at once would double every ticket.
+
+## Incidental: fields the AMDB index already has
+
+Not changed here, because it is a scope decision rather than a migration concern, but worth
+knowing now that the mapping is visible. The action currently hardcodes several tags to `"NA"`
+that `kibana_sdp_amdb` actually carries per host: `svc-operator` / `svc_operator`,
+`svc-software-owner` / `svc_software_owner`, and `app_code` (the config index's own view of the
+app code, as opposed to `labels.app_code` from the metric document). There is also a
+`maintenance` object with real `utc_start` / `utc_end` dates and an `sdp_ticket_id`, while
+`hs:app:maintenance-window` is hardcoded `"true"`.
+
+With the `LOOKUP JOIN` rule these are already joined in and could be carried into the ticket by
+adding them to the `STATS ... BY` (or via `VALUES()`); with the `ENRICH` variant they would need
+adding to the policy's `enrich_fields`. Worth a separate conversation about which source of
+truth the ticketing process should use — this change deliberately keeps the emitted event
+identical to Stage 2's so the migration is comparable.
 
 ## What was verified, and how
 
@@ -223,45 +308,76 @@ half was executed for real. What that established:
 - For a remote join, `Mapper.mapBinary` wraps the *whole* join in one `FragmentExec` shipped
   to the remote cluster — consistent with the "lookup index must exist on every cluster"
   requirement.
+- **Coordinator-mode `ENRICH` carries none of the remote restrictions**, which is what makes
+  the variant legal after `STATS`: in `Enrich.java`, `postAnalysisVerification` and
+  `checkForPlansForbiddenBeforeRemoteEnrich` both gate on `mode == Mode.REMOTE`, so
+  `Mode.COORDINATOR` is unconstrained.
 
 **Executed, using Kibana 9.3's own code:** the ES|QL ANTLR parser (`@kbn/esql-ast`), the
 alert-ID derivation (`getAlertIdFields`/`getEsqlQueryHits` from the `stack_alerts` plugin) and
 the action renderer (`renderMustacheObject` from the `actions` plugin) were bundled out of the
 `9.3` branch and run against this rule:
 
-- The query parses clean, both as stored and with Kibana's appended `| limit 1000`.
+- Both queries parse clean, as stored and with Kibana's appended `| limit 1000`.
 - Each construct was isolated and parsed: dotted `RENAME` targets, multi-assignment `EVAL`,
   arithmetic on an aggregate inside `STATS`, `ROUND` around an aggregate, dotted `BY` fields,
   and the `prod:-metricbeat-7*` exclusion (which parses as prefix `prod` + index
   `-metricbeat-7*`).
-- `getAlertIdFields` returns `["hostname.keyword","labels.client_code","labels.app_code"]`,
-  confirming Kibana's parser follows the trailing `RENAME` through to the final column names,
-  and that two breaching hosts yield two distinct alert IDs with no duplicate-ID warning.
+- `getAlertIdFields` returns `["hostname.keyword","labels.client_code","labels.app_code"]` for
+  **both** variants, confirming Kibana's parser follows a trailing `RENAME` through to the
+  final column names (the `ENRICH` variant relies on this for `host.hostname` →
+  `hostname.keyword`), and that two breaching hosts yield two distinct alert IDs with no
+  duplicate-ID warning.
+- The collision analysis was run mechanically against the transcribed mapping: of the 51
+  columns `kibana_sdp_amdb` contributes to the join, the only one that overlaps a column the
+  rule depends on is `hostname.keyword`, the join key itself. No `labels.*` field exists in the
+  config index, which is what allowed the guard columns to be removed.
 - Kibana builds `_source` **flat**, with literal dotted keys
   (`{"hostname.keyword": "...", "labels.client_code": "..."}`) — but the action renderer runs
   `expandDottedKeys` first, turning those into nested objects, so
   `{{context.hits.0._source.hostname.keyword}}` resolves correctly. This is worth knowing
   because it is the renderer, not the rule, that makes the dotted template paths work.
-- The full action document renders with **no unresolved `{{...}}` tags and no empty fields**.
-  The rendered ticket is in the commit message for this change.
+- The full action document renders, for both variants, with **no unresolved `{{...}}` tags and
+  no empty fields**, and identical output. The rendered ticket is in the commit message.
 
 The two defects this turned up — the `alarm_reason` float noise, and Stage 2's
 `.app_code.keyword` path rendering empty — were fixed before committing and the simulation
 re-run clean.
 
-Still unverified, and only a live cluster can settle it: that `kibana_sdp_amdb` on `prod`
-resolves and joins as expected, and the real shape of that index's mapping (see the collision
-note above). Both are covered by the cutover steps below.
+Still unverified, and only a live cluster can settle it:
+
+- that `kibana_sdp_amdb` on `prod` resolves and joins as expected (LOOKUP JOIN route), or that
+  the enrich policy resolves in `_coordinator` mode (ENRICH route);
+- that ES|QL equality against the `text`-mapped `group` / `alert_status` behaves as it does in
+  Stage 2 today. Stage 2 runs the identical predicates against the identical fields, so this is
+  as close to proven as it gets without a cluster, but it is inherited rather than tested here;
+- the cost of joining raw metric documents at your fleet's volume, which is the one thing that
+  might push you to the ENRICH variant on performance grounds rather than on the prod-copy
+  question.
+
+All of these are covered by the cutover steps below.
 
 ## Suggested cutover
 
-1. Create `kibana_sdp_amdb` as a lookup-mode index on `prod` and sync it.
-2. Create the new rule from `10008_single_stage`, leave it disabled.
+0. Decide the route (see the table above). Everything below is the same either way apart from
+   step 1.
+1. Set up the dependency:
+   - *LOOKUP JOIN:* run `kibana_sdp_amdb_prod_lookup_index` on `prod`, load the data, and put
+     the sync in place.
+   - *ENRICH:* run `kibana_sdp_amdb_enrich_policy` on the local cluster, including the
+     `_execute`, and schedule the re-execution.
+2. Create the rule (`10008_single_stage` or `10008_single_stage_enrich_variant`), leave it
+   disabled.
 3. Open it in the rule editor and run **Test query**; confirm it returns the breaching,
-   AMDB-enabled hosts you expect. An empty result with no error is the signature of a
-   missing/misconfigured lookup index on `prod` (see prerequisite 2).
+   AMDB-enabled hosts you expect. **An empty result with no error is the signature of a missing
+   dependency** — a lookup index that is absent or not in lookup mode on `prod`, or an enrich
+   policy that was never executed. Do not read "no rows" as "no breaches" until you have
+   confirmed the dependency resolves; cross-check against a host you know is breaching.
 4. Enable it and compare its output in `kibana_alerts` against Stage 2's for a cycle or two.
-5. Disable Stage 1 and Stage 2. Once the pattern is proven here, repeat for 10004, 10050 and
+   Expect one round of "new" alerts, since alert identities do not carry over.
+5. Check the rule's execution duration in *Stack Management → Rules* before trusting it at
+   steady state — for the LOOKUP JOIN route this is where excessive join volume would show up.
+6. Disable Stage 1 and Stage 2. Once the pattern is proven here, repeat for 10004, 10050 and
    the rest, then retire `kibana_threshold_alerts`.
 
 ## References
@@ -291,6 +407,16 @@ Version-specific documentation for the 9.x behaviour this rule depends on:
   clusters, use coordinator mode to join against a local cluster lookup index copy."*
   Confirms that on 9.3 the copy on `prod` is mandatory.
 - **CCS prerequisites and `skip_unavailable` behaviour** — [ES|QL across clusters (9.3 docs)](https://github.com/elastic/elasticsearch/blob/9.3/docs/reference/query-languages/esql/esql-cross-clusters.md).
+- **Coordinator-mode `ENRICH`** (the basis of the variant) — [ES|QL across clusters → Enrich with coordinator mode (9.3)](https://github.com/elastic/elasticsearch/blob/9.3/docs/reference/query-languages/esql/esql-cross-clusters.md#esql-enrich-coordinator):
+  *"{{esql}} provides the enrich `_coordinator` mode to force {{esql}} to execute the enrich
+  command on the local cluster. Use this mode when the enrich policy is not available on the
+  remote clusters or maintaining consistency of enrich indices across clusters is
+  challenging."* — which is precisely the situation here. The same page documents that it is
+  `_remote` enrich, not `_coordinator`, that cannot follow `STATS`.
+- **`LOOKUP JOIN` vs `ENRICH` trade-off** — [Join data with LOOKUP JOIN → Compare with ENRICH (9.3)](https://github.com/elastic/elasticsearch/blob/9.3/docs/reference/query-languages/esql/esql-lookup-join.md#compare-with-enrich):
+  prefer `LOOKUP JOIN` when *"your enrichment data changes frequently"* and you *"want to avoid
+  index-time processing"* — the reason the original design reached for it, and the reason the
+  enrich variant is the fallback rather than the default.
 - **Multi-typed fields / union types** — [Using ES|QL to query multiple indices (9.3 docs)](https://github.com/elastic/elasticsearch/blob/9.3/docs/reference/query-languages/esql/esql-multi-index.md#union-types)
   and [ES|QL limitations (9.3)](https://github.com/elastic/elasticsearch/blob/9.3/docs/reference/query-languages/esql/limitations.md)
   (also the source of the 10,000-row `LIMIT` ceiling).
