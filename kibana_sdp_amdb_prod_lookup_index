@@ -1,0 +1,107 @@
+# Create kibana_sdp_amdb as a lookup-mode index ON THE prod CLUSTER.
+#
+# Required only for the LOOKUP JOIN rule (10008_single_stage). On 9.3 a remote
+# LOOKUP JOIN resolves the lookup index on each cluster it queries and joins
+# against that cluster's own copy -- joining against the local copy while the
+# data is remote ("coordinator mode") is 9.6+. Since the query reads
+# prod:metricbeat-*, the copy has to live on prod.
+#
+# Run this against the prod cluster, NOT the local/CCS cluster. The local
+# kibana_sdp_amdb stays exactly as it is; Stage 2 keeps using it until cutover.
+#
+# Mapping below is only the subset the rule actually reads. A lookup index does
+# not need the other ~45 fields of the full AMDB config, and keeping it narrow
+# means less to replicate and no chance of a field from this index shadowing a
+# metricbeat column during the join. If you would rather mirror the index
+# wholesale (e.g. via CCR), that also works -- the join only requires that
+# index.mode is lookup and that hostname, group and alert_status are present.
+#
+# Types are copied from the local index's mapping so the join key stays
+# compatible: hostname is text with a .keyword subfield, which is why the rule
+# joins ON hostname.keyword and not ON hostname.
+
+PUT kibana_sdp_amdb
+{
+  "settings": {
+    "index.mode": "lookup"
+  },
+  "mappings": {
+    "properties": {
+      "hostname": {
+        "type": "text",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "ignore_above": 256
+          }
+        }
+      },
+      "group": {
+        "type": "text",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "ignore_above": 256
+          }
+        }
+      },
+      "alert_status": {
+        "type": "text",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "ignore_above": 256
+          }
+        }
+      }
+    }
+  }
+}
+
+# Verify (on prod). index.mode must read "lookup"; a lookup index is always
+# single-sharded.
+
+GET kibana_sdp_amdb/_settings?filter_path=**.mode,**.number_of_shards
+
+# --------------------------------------------------------------------------
+# Keeping it in sync
+# --------------------------------------------------------------------------
+# The AMDB config changes rarely, so a periodic refresh is enough. Options, in
+# rough order of least-moving-parts:
+#
+# 1. Reindex from remote, run on prod, pulling from the local cluster. Needs
+#    reindex.remote.whitelist to include the local cluster's host on prod, and
+#    the local host must be reachable from prod:
+#
+#      POST _reindex
+#      {
+#        "source": {
+#          "remote": { "host": "https://<local-cluster-host>:9243",
+#                      "username": "<user>", "password": "<pass>" },
+#          "index": "kibana_sdp_amdb",
+#          "_source": ["hostname", "group", "alert_status"]
+#        },
+#        "dest": { "index": "kibana_sdp_amdb", "op_type": "index" }
+#      }
+#
+#    Schedule it (Watcher is gone here, so an external scheduler or the same
+#    pipeline that maintains AMDB). Deletions need handling -- either recreate
+#    the index each run, or reconcile.
+#
+# 2. Dual-write from whatever already populates the local kibana_sdp_amdb.
+#    Cleanest if that process is under your control, since it removes the
+#    replication step entirely.
+#
+# 3. Cross-cluster replication. Attractive because it is continuous and this
+#    deployment already uses CCR, but note the direction: CCR pulls, so prod
+#    would be the follower and would need the LOCAL cluster configured as a
+#    remote on prod. The existing CCS link runs the other way (local -> prod),
+#    so this needs a new remote-cluster connection that may not be there today.
+#    Also confirm the follower keeps index.mode: lookup -- the join fails
+#    without it -- and remember follower indices are read-only.
+#
+# Whichever you pick: if this index is missing, empty or not in lookup mode on
+# prod, remote clusters default to skip_unavailable: true and "does not have the
+# requested index" is a skip condition, so the rule runs GREEN with ZERO alerts
+# rather than erroring. Always confirm with Test query in the rule editor after
+# a sync change.

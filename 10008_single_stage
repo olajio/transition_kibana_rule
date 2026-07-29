@@ -1,0 +1,101 @@
+POST kbn:/api/alerting/rule/0f7b2449-d7fe-479a-ad04-4e958865746d
+{
+  "name": "ITSMA Test 10008 - System CPU Utilization > 98%",
+  "tags": [
+    "ITSMA",
+    "Test",
+    "Threshold rule",
+    "10008",
+    "CPU",
+    "Single stage",
+    "LOOKUP JOIN"
+  ],
+  "rule_type_id": ".es-query",
+  "consumer": "stackAlerts",
+  "schedule": {
+    "interval": "5m"
+  },
+  "params": {
+    "searchType": "esqlQuery",
+    "timeWindowSize": 5,
+    "timeWindowUnit": "m",
+    "threshold": [
+      0
+    ],
+    "thresholdComparator": ">",
+    "size": 100,
+    "esqlQuery": {
+      "esql": "FROM prod:metricbeat-*, prod:-metricbeat-7*\n| WHERE event.dataset == \"system.cpu\" AND @timestamp > NOW() - 5 minutes\n| RENAME host.hostname AS hostname.keyword\n| LOOKUP JOIN kibana_sdp_amdb ON hostname.keyword\n| MV_EXPAND group\n| WHERE group == \"10008\" AND alert_status == \"enabled\"\n| STATS avg_cpu = AVG(system.cpu.total.norm.pct) * 100 BY hostname.keyword, labels.client_code, labels.app_code\n| WHERE avg_cpu > 98\n| EVAL current_value = ROUND(avg_cpu, 2)\n| DROP avg_cpu\n| LIMIT 10000\n"
+    },
+    "aggType": "count",
+    "groupBy": "row",
+    "termSize": 5,
+    "sourceFields": [],
+    "timeField": "@timestamp",
+    "excludeHitsFromPreviousRun": true
+  },
+  "artifacts": {
+    "dashboards": [],
+    "investigation_guide": {
+      "blob": ""
+    }
+  },
+  "actions": [
+    {
+      "group": "query matched",
+      "id": "69fdac41-8a5e-483d-a506-19660d8550eb",
+      "params": {
+        "documents": [
+          {
+            "target": "{{context.hits.0._source.hostname.keyword}}",
+            "event_type": "10008",
+            "event_uuid": "on-prem_10008_{{context.hits.0._source.hostname.keyword}}",
+            "alarm_name": "10008 - CPU Utilization > 98%",
+            "trace": {
+              "id": "{{alert.uuid}}"
+            },
+            "tags_to_exclude": "NA",
+            "cloud": {
+              "region": "NA",
+              "account": {
+                "name": "NA",
+                "id": "NA"
+              }
+            },
+            "labels": {
+              "client_code": "{{context.hits.0._source.labels.client_code}}"
+            },
+            "@timestamp": "{{date}}",
+            "amdb_link": "https://hedgeservcorp.sharepoint.com/sites/globaltechnology/amdb/sitepages/10008---system-cpu-utilization---98-.aspx?web=1",
+            "dashboard_link": "https://287d86a4b1184182b340bd5074cdfd7e.us-east-1.aws.found.io:9243/s/information-technology/app/r/s/wmCdY",
+            "service": {
+              "type": "kibana_alerts",
+              "name": "cpu_utilization"
+            },
+            "alarm_tags": {
+              "hs:app:maintenance-window": "true",
+              "hs:std:app-name": "NA",
+              "hs:app:amdb": "10008",
+              "hs:app:sdp-priority": "2 - High",
+              "hs:std:svc-operator": "NA",
+              "hs:std:svc-software-owner": "NA",
+              "hs:app:monitored": "true",
+              "hs:std:app-code": "{{context.hits.0._source.labels.app_code}}",
+              "hs:app:ticket-group": "Monitoring and Analytics - Testing"
+            },
+            "alarm_reason": "Average CPU utilization over the last 5 minutes is {{context.hits.0._source.current_value}}"
+          }
+        ]
+      },
+      "frequency": {
+        "notify_when": "onActiveAlert",
+        "throttle": null,
+        "summary": false
+      },
+      "uuid": "2d55a461-5ed4-4666-9a57-d274aa0f4c9d"
+    }
+  ],
+  "alert_delay": {
+    "active": 1
+  }
+}
