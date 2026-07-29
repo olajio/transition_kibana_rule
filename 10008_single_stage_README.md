@@ -48,8 +48,10 @@ FROM prod:metricbeat-*, prod:-metricbeat-7*
 | LOOKUP JOIN kibana_sdp_amdb ON hostname.keyword
 | MV_EXPAND group
 | WHERE group == "10008" AND alert_status == "enabled"
-| STATS current_value = AVG(system.cpu.total.norm.pct) * 100 BY hostname.keyword, metric_client_code, metric_app_code
-| WHERE current_value > 98
+| STATS avg_cpu = AVG(system.cpu.total.norm.pct) * 100 BY hostname.keyword, metric_client_code, metric_app_code
+| WHERE avg_cpu > 98
+| EVAL current_value = ROUND(avg_cpu, 2)
+| DROP avg_cpu
 | RENAME metric_client_code AS labels.client_code, metric_app_code AS labels.app_code
 | LIMIT 10000
 ```
@@ -94,7 +96,14 @@ Line by line:
   If a host matches several `kibana_sdp_amdb` documents its metric rows are duplicated, but
   every row for that host duplicates equally and the group is keyed by host, so `AVG` is
   unaffected.
-- **`current_value`** — named to match what the action template already reads, so the ticket
+- **`ROUND(avg_cpu, 2)` into `current_value`** — the threshold is compared against the true
+  average (`WHERE avg_cpu > 98`) and only the *displayed* value is rounded, so rounding cannot
+  move a host across the threshold. This matters because Kibana stringifies ES|QL values
+  verbatim (`row[i].toString()`), and `AVG(scaled_float) * 100` produces IEEE-754 noise:
+  without the rounding, `alarm_reason` reads *"…is 99.11999999999999"*. The two-stage flow hid
+  this by round-tripping `avg_cpu` through `current_value`, a `float`-mapped field in
+  `kibana_threshold_alerts`; a single-stage rule has no such round trip and has to round
+  explicitly. `current_value` keeps the name the action template already reads, so the ticket
   body is unchanged.
 
 ## Prerequisites before enabling
@@ -151,12 +160,29 @@ Worth knowing before the cutover — none of these are bugs, but they are change
   "ITSMA Test Kibana Alerts Threshold Breached connector" — note it would then only record
   breaches that survived the AMDB filter.
 - **`hs:std:app-code` now reads `{{context.hits.0._source.labels.app_code}}`**, not
-  `labels.app_code.keyword`. Stage 2 needed the `.keyword` suffix because it was reading a
-  `text`-mapped field out of `kibana_threshold_alerts`; here the column is produced by the
-  query itself, so it's a plain value. Every other field in the emitted event is byte-for-byte
-  Stage 2's.
-- `size` is left at 100, as in both existing rules — that caps how many rows reach the
-  actions, so it caps alerts per run at 100 breaching hosts.
+  `labels.app_code.keyword`. Stage 2 read `labels.app_code` out of `kibana_threshold_alerts`,
+  where it is mapped as `text` with a `.keyword` subfield that ES|QL surfaces as its own
+  column; here the column is produced by the query itself and is plain `keyword`. Rendering
+  Stage 2's `.app_code.keyword` path against the new column set produces an **empty string**,
+  so this change is required, not cosmetic. Every other field in the emitted event is
+  byte-for-byte Stage 2's.
+- **The alert identity is now `hostname.keyword, labels.client_code, labels.app_code`** — the
+  `BY` fields of the last `STATS`, which is how Kibana derives the alert ID for row-grouped
+  ES|QL rules. Stage 2's query had no `STATS`, so its alert ID fell back to *every* returned
+  column, which is both unstable and long enough to risk Kibana's "alert ID is very long"
+  warning. This is an improvement, but it does mean alert identities do not carry over from
+  Stage 2 — expect one round of "new" alerts at cutover.
+- If a host has no `labels.app_code`, that field drops out of the alert ID (identity becomes
+  host + client code) and `hs:std:app-code` renders as an empty string. Stage 2 behaved the
+  same way for missing values.
+- `size` is left at 100 to match the existing rules, but **it has no effect on an ES|QL rule** —
+  `params.size` is only read on the Query DSL path. The real cap is the alerting framework's
+  max-alerts value, which Kibana appends to the query as `| limit <alertLimit>` (1000 by
+  default). So the effective ceiling is 1000 breaching hosts per run, not 100, and the
+  trailing `| LIMIT 10000` in the query is superseded by that appended limit.
+- `threshold: [0]` / `thresholdComparator: ">"` are also inert here: for row-grouped rules the
+  executor sets `met = true` unconditionally and never calls the comparator. The `WHERE
+  avg_cpu > 98` in the ES|QL is the only threshold, which is why it must stay in the query.
 
 ## Files
 
@@ -168,6 +194,64 @@ Worth knowing before the cutover — none of these are bugs, but they are change
   (*Stack Management → Saved Objects → Import*). Imported disabled (`enabled: false`); it
   references the existing connector `69fdac41-8a5e-483d-a506-19660d8550eb`
   ("ITSMA Test Kibana Alerts Final connector"), which must already be present.
+
+## What was verified, and how
+
+A live two-cluster test was not possible in the environment this was written in
+(`docker.elastic.co` blobs and `artifacts.elastic.co` are both unreachable there), so the
+design was checked against the actual 9.3 source of Elasticsearch and Kibana, and the Kibana
+half was executed for real. What that established:
+
+**Against `elastic/elasticsearch` @ `9.3`:**
+
+- The cross-cluster restriction is enforced in `Join.checkRemoteJoin`
+  (`x-pack/plugin/esql/.../plan/logical/join/Join.java`), which fails the query for any
+  `PipelineBreaker` or coordinator-only node *before* a remote join:
+  `"LOOKUP JOIN with remote indices can't be executed after [...]"`. The only
+  `PipelineBreaker` implementations are `Aggregate`, `TopN` and `Limit` — i.e. exactly
+  `STATS`, `SORT` and `LIMIT`, as documented. **`MvExpand` is not a pipeline breaker**, which
+  is what makes `LOOKUP JOIN → MV_EXPAND → WHERE → STATS` legal.
+- **Kibana's injected time filter does not break the join.** Kibana passes the time window as
+  a Query DSL `filter` on the ES|QL request, and `kibana_sdp_amdb` has no `@timestamp` — if
+  that filter reached the lookup index the join would match nothing and the rule would run
+  green with zero alerts. It does not, on either path: at resolution,
+  `preAnalyzeLookupIndices` is called without the request filter (only
+  `preAnalyzeMainIndices` receives it); at execution, `LocalMapper` wraps the join's right
+  side in a `FragmentExec`, which is a `LeafExec`, so the
+  `transformUp(EsSourceExec.class, …)` that applies the filter in `PlannerUtils.localPlan`
+  cannot reach inside it.
+- For a remote join, `Mapper.mapBinary` wraps the *whole* join in one `FragmentExec` shipped
+  to the remote cluster — consistent with the "lookup index must exist on every cluster"
+  requirement.
+
+**Executed, using Kibana 9.3's own code:** the ES|QL ANTLR parser (`@kbn/esql-ast`), the
+alert-ID derivation (`getAlertIdFields`/`getEsqlQueryHits` from the `stack_alerts` plugin) and
+the action renderer (`renderMustacheObject` from the `actions` plugin) were bundled out of the
+`9.3` branch and run against this rule:
+
+- The query parses clean, both as stored and with Kibana's appended `| limit 1000`.
+- Each construct was isolated and parsed: dotted `RENAME` targets, multi-assignment `EVAL`,
+  arithmetic on an aggregate inside `STATS`, `ROUND` around an aggregate, dotted `BY` fields,
+  and the `prod:-metricbeat-7*` exclusion (which parses as prefix `prod` + index
+  `-metricbeat-7*`).
+- `getAlertIdFields` returns `["hostname.keyword","labels.client_code","labels.app_code"]`,
+  confirming Kibana's parser follows the trailing `RENAME` through to the final column names,
+  and that two breaching hosts yield two distinct alert IDs with no duplicate-ID warning.
+- Kibana builds `_source` **flat**, with literal dotted keys
+  (`{"hostname.keyword": "...", "labels.client_code": "..."}`) — but the action renderer runs
+  `expandDottedKeys` first, turning those into nested objects, so
+  `{{context.hits.0._source.hostname.keyword}}` resolves correctly. This is worth knowing
+  because it is the renderer, not the rule, that makes the dotted template paths work.
+- The full action document renders with **no unresolved `{{...}}` tags and no empty fields**.
+  The rendered ticket is in the commit message for this change.
+
+The two defects this turned up — the `alarm_reason` float noise, and Stage 2's
+`.app_code.keyword` path rendering empty — were fixed before committing and the simulation
+re-run clean.
+
+Still unverified, and only a live cluster can settle it: that `kibana_sdp_amdb` on `prod`
+resolves and joins as expected, and the real shape of that index's mapping (see the collision
+note above). Both are covered by the cutover steps below.
 
 ## Suggested cutover
 

@@ -25,7 +25,7 @@ POST kbn:/api/alerting/rule/0f7b2449-d7fe-479a-ad04-4e958865746d
     "thresholdComparator": ">",
     "size": 100,
     "esqlQuery": {
-      "esql": "FROM prod:metricbeat-*, prod:-metricbeat-7*\n| WHERE event.dataset == \"system.cpu\" AND @timestamp > NOW() - 5 minutes\n| EVAL metric_client_code = labels.client_code, metric_app_code = labels.app_code\n| RENAME host.hostname AS hostname.keyword\n| LOOKUP JOIN kibana_sdp_amdb ON hostname.keyword\n| MV_EXPAND group\n| WHERE group == \"10008\" AND alert_status == \"enabled\"\n| STATS current_value = AVG(system.cpu.total.norm.pct) * 100 BY hostname.keyword, metric_client_code, metric_app_code\n| WHERE current_value > 98\n| RENAME metric_client_code AS labels.client_code, metric_app_code AS labels.app_code\n| LIMIT 10000\n"
+      "esql": "FROM prod:metricbeat-*, prod:-metricbeat-7*\n| WHERE event.dataset == \"system.cpu\" AND @timestamp > NOW() - 5 minutes\n| EVAL metric_client_code = labels.client_code, metric_app_code = labels.app_code\n| RENAME host.hostname AS hostname.keyword\n| LOOKUP JOIN kibana_sdp_amdb ON hostname.keyword\n| MV_EXPAND group\n| WHERE group == \"10008\" AND alert_status == \"enabled\"\n| STATS avg_cpu = AVG(system.cpu.total.norm.pct) * 100 BY hostname.keyword, metric_client_code, metric_app_code\n| WHERE avg_cpu > 98\n| EVAL current_value = ROUND(avg_cpu, 2)\n| DROP avg_cpu\n| RENAME metric_client_code AS labels.client_code, metric_app_code AS labels.app_code\n| LIMIT 10000\n"
     },
     "aggType": "count",
     "groupBy": "row",
