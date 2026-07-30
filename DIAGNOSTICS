@@ -1,0 +1,116 @@
+# Diagnostics for the three editor errors on the consolidated rule.
+#
+# All three came from Kibana's client-side ES|QL validator (the squiggles in the
+# query editor), not from Elasticsearch. Two were real, one is about the editor's
+# view of your cluster. Run these to confirm on your side.
+
+# ==========================================================================
+# 1. Lines 2 and 7: "invalid input types for ==" / "Invalid input types for AVG"
+# ==========================================================================
+# Cause: event.dataset and system.cpu.total.norm.pct both resolve to type
+# "unsupported" over prod:metricbeat-*, because they are mapped with conflicting
+# types across the indices that pattern matches. ES|QL refuses a multi-typed
+# field, so == gets (unsupported, keyword) and AVG gets (unsupported).
+#
+# This is the same root cause as the verification_exception Stage 1 was already
+# failing with. That error named 3 legacy 7.x indices "and [3] other indices",
+# so excluding metricbeat-7* was never going to be enough -- hence the explicit
+# casts in the rule now.
+#
+# _field_caps is the definitive view. Anything reporting more than one type
+# block for a field is a conflict; each block lists the indices involved:
+
+GET prod:metricbeat-*/_field_caps?fields=event.dataset,system.cpu.total.norm.pct,host.hostname,labels.client_code,labels.app_code&filters=-parent
+
+# The rule already casts the two known offenders:
+#
+#   | EVAL event_dataset = event.dataset::keyword,
+#          cpu_pct       = system.cpu.total.norm.pct::double
+#   | WHERE event_dataset == "system.cpu" AND cpu_pct IS NOT NULL
+#
+# Casting is the documented fix for multi-typed fields ("union types"). It works
+# as long as the ONLY reference to the raw field is the cast itself -- which is
+# why the raw names do not appear anywhere else in the query.
+#
+# If _field_caps shows host.hostname, labels.client_code or labels.app_code also
+# conflicting, cast them the same way BEFORE they are used. host.hostname is the
+# join key, so it would become:
+#
+#   | EVAL hostname.keyword = host.hostname::keyword
+#
+# (replacing the RENAME), and the STATS BY fields would become:
+#
+#   | EVAL client_code = labels.client_code::keyword,
+#          app_code    = labels.app_code::keyword
+#
+# ...remembering that the action templates read labels.client_code and
+# labels.app_code, so you would need a trailing
+# RENAME client_code AS labels.client_code, app_code AS labels.app_code
+# to keep the emitted event unchanged.
+#
+# You may still see a residual WARNING (not error) saying the raw field "cannot
+# be retrieved, it is unsupported or not indexed; returning null". That is
+# expected and harmless: it refers to the uncast field, which is exactly why the
+# cast is there. Errors block, warnings do not.
+
+# ==========================================================================
+# 2. Line 4: "kibana_sdp_amdb" is not a valid JOIN index
+# ==========================================================================
+# This message is emitted when the index is absent from the list Kibana fetched
+# via its getJoinIndices callback -- i.e. the lookup-mode indices Kibana can see
+# on the cluster it is connected to. It is a check against that list, not
+# against the remote cluster.
+#
+# Confirm the local index really is in lookup mode. This must return "lookup":
+
+GET kibana_sdp_amdb/_settings?filter_path=**.mode
+
+# If it returns nothing or "standard", that is the actual problem and it would
+# also mean Stage 2 could not be joining -- worth reconciling, since Stage 2's
+# last runs are recorded as succeeded.
+#
+# If it does return "lookup", the editor message is a false positive for this
+# editing context, BUT the query still cannot execute as-is, because the copy on
+# prod is what the join actually needs. Check prod separately:
+
+GET kibana_sdp_amdb/_settings?filter_path=**.mode     # <- run against prod
+
+# Missing there? Then either:
+#   - create it (kibana_sdp_amdb_prod_lookup_index), or
+#   - use the ENRICH variant (10008_single_stage_enrich_variant plus
+#     kibana_sdp_amdb_enrich_policy), which needs nothing on prod.
+
+# ==========================================================================
+# 3. Trust the server, not the editor
+# ==========================================================================
+# Kibana's ES|QL validator is a static approximation and has known gaps. One that
+# affects the ENRICH variant directly: it does not add a policy's enrich_fields
+# to its column list, so it reports Unknown column "group" / "alert_status" after
+# the ENRICH even when the policy resolves correctly. Verified against Kibana's
+# own test fixtures -- a deliberately wrong policy name produces an additional
+# "Unknown policy" error, so policy resolution works while the enrich columns are
+# simply never registered.
+#
+# So: run the query. Test query in the rule editor, or here, is the authority:
+
+POST _query?format=txt
+{
+  "query": "FROM prod:metricbeat-* | WHERE @timestamp > NOW() - 5 minutes | EVAL event_dataset = event.dataset::keyword, cpu_pct = system.cpu.total.norm.pct::double | WHERE event_dataset == \"system.cpu\" AND cpu_pct IS NOT NULL | STATS avg_cpu = AVG(cpu_pct) * 100 BY host.hostname | SORT avg_cpu DESC | LIMIT 20"
+}
+
+# That isolates the metricbeat half with the casts applied and no join, so a
+# clean result confirms the fix for errors 1 and 2 independently of the AMDB
+# lookup. Add the join or the enrich back once it returns rows.
+#
+# Then confirm the config filter resolves, on whichever route you picked:
+
+POST _query?format=txt
+{
+  "query": "FROM prod:metricbeat-* | WHERE @timestamp > NOW() - 5 minutes | EVAL cpu_pct = system.cpu.total.norm.pct::double | WHERE cpu_pct IS NOT NULL | RENAME host.hostname AS hostname.keyword | LOOKUP JOIN kibana_sdp_amdb ON hostname.keyword | MV_EXPAND group | WHERE group == \"10008\" AND alert_status == \"enabled\" | KEEP hostname.keyword, group, alert_status | LIMIT 20"
+}
+
+# Zero rows with no error here means the join found no matching config -- check
+# the prod copy exists, is in lookup mode, and is populated. Remote clusters
+# default to skip_unavailable: true, so a missing index can be reported as a
+# skipped cluster rather than an error; check the _clusters section of the
+# response (drop ?format=txt to see it).
