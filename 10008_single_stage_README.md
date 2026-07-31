@@ -76,6 +76,36 @@ window.
 
 Both emit a byte-identical event and both were verified the same way (see below).
 
+### Recommended: one keyword source of truth (`kibana_sdp_amdb_enrich`)
+
+The `text` + `.keyword` shape of `kibana_sdp_amdb` is what forces the awkwardness on both routes
+— the reindex on the ENRICH side, the `.keyword` gymnastics on the LOOKUP JOIN side. Since a
+field's type can't be changed in place, the cleaner end state is a single **keyword-mapped,
+`index.mode: lookup`** index, `kibana_sdp_amdb_enrich`, that you write to directly and treat as
+the source of truth — retiring `kibana_sdp_amdb`. One index serves both routes (verified: lookup
+mode doesn't restrict writes, and enrich has no source-index-mode restriction), so this is not a
+third strategy — it's a better *input* to whichever of the two routes you pick:
+
+| | `10008_single_stage_enrich_index` (LOOKUP JOIN) | `10008_single_stage_enrich_variant` (ENRICH) |
+|---|---|---|
+| Lookup source | `kibana_sdp_amdb_enrich`, **live** | enrich policy built on `kibana_sdp_amdb_enrich` |
+| Needs on `prod` | the index, populated | **nothing** |
+| Recurring upkeep | none — writes take effect immediately | **re-`_execute` the policy after every change** |
+| `hostname` | plain `keyword`, join `ON hostname` | plain `keyword`, `match_field: hostname` |
+
+The one thing this model does **not** remove is the enrich `_execute`. Enrich reindexes the
+source into a hidden snapshot at execute time and reads *that*, never the live index — so on the
+ENRICH route, a record you write to `kibana_sdp_amdb_enrich` does nothing until you re-execute
+the policy. Only the **LOOKUP JOIN** route gives "writes take effect immediately," and only if
+the index is on `prod`. That trade — live-but-on-prod vs local-but-snapshot — is the actual
+decision; the source-of-truth index just makes both sides clean.
+
+Setup lives in `kibana_sdp_amdb_enrich_index` (create + one-time migrate + write-path and
+retirement notes). The rule files for this model are `10008_single_stage_enrich_index` (+ `.ndjson`)
+for LOOKUP JOIN and `10008_single_stage_enrich_variant` + `kibana_sdp_amdb_enrich_policy` for
+ENRICH. The original `10008_single_stage` still works against the unmodified `text`+`.keyword`
+`kibana_sdp_amdb` if you would rather not migrate the index at all.
+
 ## The consolidated query (LOOKUP JOIN)
 
 ```esql
@@ -220,11 +250,17 @@ Line by line:
 
 ## Prerequisites before enabling
 
-**For the ENRICH variant:** run `kibana_sdp_amdb_enrich_policy` on the local cluster. It is no
-longer a one-liner — enrich cannot match on the `hostname.keyword` multi-field (see the file for
-the full reason), so the steps are: reindex `hostname`/`group`/`alert_status` into a small
-keyword-typed source (`kibana_sdp_amdb_enrich`), create the policy on that source, and execute
-it. Nothing on `prod`. Skip to point 3.
+**For the ENRICH variant:** first create the source of truth with `kibana_sdp_amdb_enrich_index`
+(create the keyword + lookup index, migrate once), then run `kibana_sdp_amdb_enrich_policy` on
+the local cluster to build the policy on it and execute it. Enrich can't match on the old
+`hostname.keyword` multi-field — the keyword `kibana_sdp_amdb_enrich` is what makes it work.
+Nothing on `prod`. Remember the policy is a snapshot: re-`_execute` after every config change.
+Skip to point 3.
+
+**For the LOOKUP JOIN variant on the source-of-truth index
+(`10008_single_stage_enrich_index`):** create `kibana_sdp_amdb_enrich` **on `prod`**, populated
+(`kibana_sdp_amdb_enrich_index`, using the reindex-from-remote form). It reads live — no policy,
+no execute. Then points 2–3 below.
 
 **For the LOOKUP JOIN rule:**
 
@@ -316,18 +352,36 @@ Worth knowing before the cutover — none of these are bugs, but they are change
   (*Stack Management → Saved Objects → Import*). Imported disabled (`enabled: false`); it
   references the existing connector `69fdac41-8a5e-483d-a506-19660d8550eb`
   ("ITSMA Test Kibana Alerts Final connector"), which must already be present.
-- `kibana_sdp_amdb_prod_lookup_index` — creates the lookup-mode copy on `prod`, with sync
-  options and caveats. Only needed for the LOOKUP JOIN rule.
-- `10008_single_stage_enrich_variant` — the alternative rule that needs nothing on `prod`.
-- `kibana_sdp_amdb_enrich_policy` — the keyword reindex + enrich policy the variant depends on,
-  including why the multi-field forces the reindex and the re-execution requirement. Only needed
-  for the ENRICH variant.
+- `kibana_sdp_amdb_prod_lookup_index` — creates a lookup-mode copy of the **original**
+  `text`+`.keyword` `kibana_sdp_amdb` on `prod`, with sync options and caveats. Only needed if
+  you run `10008_single_stage` (the original LOOKUP JOIN rule) rather than migrating to
+  `kibana_sdp_amdb_enrich`.
+
+**Source-of-truth model (recommended — see the section above):**
+
+- `kibana_sdp_amdb_enrich_index` — creates the single keyword-mapped, `index.mode: lookup`
+  index `kibana_sdp_amdb_enrich`, migrates config across once, and documents the write path
+  (write directly, `group` as an array) and the safe order for retiring `kibana_sdp_amdb`.
+  Shared by both rules below.
+- `10008_single_stage_enrich_index` (+ `.ndjson`) — the **LOOKUP JOIN** rule against
+  `kibana_sdp_amdb_enrich`. Same as `10008_single_stage` but `hostname` is a plain keyword:
+  `RENAME … AS hostname`, `LOOKUP JOIN kibana_sdp_amdb_enrich ON hostname`, `STATS … BY
+  hostname`, and the action template reads `_source.hostname`. Emitted ticket is identical.
+  Needs `kibana_sdp_amdb_enrich` on `prod`; reads live.
+- `10008_single_stage_enrich_variant` — the **ENRICH** rule. Needs nothing on `prod`; depends
+  on the policy below.
+- `kibana_sdp_amdb_enrich_policy` — builds the enrich policy on `kibana_sdp_amdb_enrich` and
+  executes it. No longer creates its own reindex source (that job moved to
+  `kibana_sdp_amdb_enrich_index`); still documents the re-`_execute`-after-every-change
+  requirement, which enrich can't shed.
+
 - `DIAGNOSTICS` — how to confirm each of the editor errors on your own cluster: the
   `_field_caps` call that identifies mapping conflicts, the `index.mode` checks for local and
   `prod`, and standalone `_query` calls that isolate the metricbeat half from the AMDB half.
 
-Pick one rule or the other; they emit the same event to the same connector, so running both
-enabled at once would double every ticket.
+Pick **one** rule — `10008_single_stage`, `10008_single_stage_enrich_index`, or
+`10008_single_stage_enrich_variant`. They emit the same event to the same connector, so running
+more than one enabled at once would multiply every ticket.
 
 ## Incidental: fields the AMDB index already has
 

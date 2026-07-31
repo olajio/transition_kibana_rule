@@ -1,0 +1,126 @@
+# Create kibana_sdp_amdb_enrich: the single, keyword-mapped source of truth that
+# replaces the text+.keyword kibana_sdp_amdb.
+#
+# Why this index exists
+# ---------------------
+# kibana_sdp_amdb maps hostname/group/alert_status as `text` with a `.keyword`
+# multi-field. That shape blocks the ENRICH route (enrich cannot use a
+# multi-field subfield as match_field) and forces awkward `.keyword` naming in
+# the LOOKUP JOIN route. You cannot change a field's type in place, so the fix is
+# a new index with those fields as plain `keyword`. Rather than keep it as a
+# reindex mirror of kibana_sdp_amdb, this makes it the source of truth: you write
+# records here directly and retire kibana_sdp_amdb.
+#
+# One index, both routes
+# ----------------------
+# Created with keyword mappings AND index.mode: lookup, so it serves either rule:
+#   - LOOKUP JOIN (10008_single_stage_enrich_index): references it directly; needs
+#     it ON prod, populated; reads live (no policy, no execute).
+#   - ENRICH     (10008_single_stage_enrich_variant): kibana_sdp_amdb_enrich_policy
+#     builds an enrich policy on it, LOCAL only; needs _execute after every change.
+# index.mode: lookup only constrains number_of_shards to 1 (fine for a small
+# config index) and does NOT restrict writes -- verified in IndexMode.java 9.3 --
+# so you can add and delete records directly. Enrich has no source-index-mode
+# restriction, so a lookup-mode index is a valid enrich source too.
+#
+# WHERE to create it
+#   - Going with LOOKUP JOIN  -> create on prod (that is where the join resolves
+#     it). You may also keep a local copy if anything local queries it.
+#   - Going with ENRICH       -> create on the local/CCS cluster (the coordinator
+#     runs the enrich there).
+
+# --------------------------------------------------------------------------
+# 1. Create the index
+# --------------------------------------------------------------------------
+# group is multi-valued per host (a list); keyword holds arrays natively, and the
+# rules MV_EXPAND it. Only the fields the rules read are typed here; add any other
+# AMDB fields you want to carry into tickets later (all as keyword or the right
+# scalar type -- avoid re-introducing text+.keyword on anything you match/join on).
+PUT kibana_sdp_amdb_enrich
+{
+  "settings": {
+    "index.mode": "lookup"
+  },
+  "mappings": {
+    "properties": {
+      "hostname":     { "type": "keyword" },
+      "group":        { "type": "keyword" },
+      "alert_status": { "type": "keyword" }
+    }
+  }
+}
+
+# --------------------------------------------------------------------------
+# 2. One-time migration from kibana_sdp_amdb
+# --------------------------------------------------------------------------
+# Copies existing config across once. After this, kibana_sdp_amdb_enrich is the
+# source of truth -- do NOT keep reindexing; point your write path here instead
+# (see below). The text -> keyword change happens because the destination mapping
+# says keyword; the stored _source values are unchanged. group arrives as an
+# array and stays one.
+#
+# If migrating to a copy on a DIFFERENT cluster (e.g. local kibana_sdp_amdb ->
+# prod kibana_sdp_amdb_enrich), use reindex-from-remote instead of this local
+# reindex -- see kibana_sdp_amdb_prod_lookup_index for the remote form.
+POST _reindex
+{
+  "source": {
+    "index": "kibana_sdp_amdb",
+    "_source": ["hostname", "group", "alert_status"]
+  },
+  "dest": { "index": "kibana_sdp_amdb_enrich" }
+}
+
+# Verify the migration: count should match kibana_sdp_amdb, hostnames should look
+# like real hostnames, and group should be an array where a host has several.
+GET kibana_sdp_amdb_enrich/_count
+GET kibana_sdp_amdb_enrich/_search
+{ "size": 5, "_source": ["hostname", "group", "alert_status"] }
+
+# --------------------------------------------------------------------------
+# 3. Make it the source of truth
+# --------------------------------------------------------------------------
+# From here on, all config edits go DIRECTLY to kibana_sdp_amdb_enrich:
+#
+#   # add / update a host (upsert by a stable _id, e.g. the hostname)
+#   PUT kibana_sdp_amdb_enrich/_doc/CS01-10VLCNPY24
+#   {
+#     "hostname": "CS01-10VLCNPY24",
+#     "group": ["10008", "10004"],          # ARRAY -- one entry per alert enabled
+#     "alert_status": "enabled"
+#   }
+#
+#   # remove a host
+#   DELETE kibana_sdp_amdb_enrich/_doc/CS01-10VLCNPY24
+#
+# Repoint whatever process currently populates kibana_sdp_amdb at this index. Two
+# things to get right in that write path:
+#   - group must be written as a JSON ARRAY, not a comma-joined string, or the
+#     MV_EXPAND / "group == 10008" filter will not behave.
+#   - use a stable document _id (the hostname is the natural choice) so updates
+#     upsert instead of creating duplicates.
+#
+# LOOKUP JOIN sees these writes LIVE. ENRICH does not -- you must re-execute the
+# policy after each change (see kibana_sdp_amdb_enrich_policy); that is inherent
+# to enrich, not something this index changes.
+
+# --------------------------------------------------------------------------
+# 4. Retiring kibana_sdp_amdb -- SEQUENCE CAREFULLY
+# --------------------------------------------------------------------------
+# Do NOT delete kibana_sdp_amdb yet. The live two-rule system (10008 Stage 2 and
+# every other *_Stage 2 rule) still does `LOOKUP JOIN kibana_sdp_amdb ON
+# hostname.keyword`. Deleting it breaks production.
+#
+# Safe order:
+#   1. create + migrate kibana_sdp_amdb_enrich (steps 1-2)
+#   2. move the write path to it (step 3), keeping kibana_sdp_amdb updated in
+#      parallel for now, OR accept that only new rules read the new index
+#   3. cut each consolidated rule over (Test query -> enable -> disable the old
+#      Stage 1/Stage 2 pair) -- see 10008_single_stage_README.md cutover
+#   4. only once NOTHING references kibana_sdp_amdb:
+#        DELETE kibana_sdp_amdb
+#
+# Naming note: "_enrich" is a legacy of how this started; it is really the general
+# AMDB source of truth now and is used by the LOOKUP JOIN route too. Rename if you
+# like -- if you do, update the index name in 10008_single_stage_enrich_index and
+# the `indices` in kibana_sdp_amdb_enrich_policy to match.
