@@ -67,13 +67,15 @@ Both emit a byte-identical event and both were verified the same way (see below)
 ## The consolidated query (LOOKUP JOIN)
 
 ```esql
-FROM prod:metricbeat-*, prod:-metricbeat-7*
-| WHERE event.dataset == "system.cpu" AND @timestamp > NOW() - 5 minutes
+FROM prod:metricbeat-*
+| WHERE @timestamp > NOW() - 5 minutes
+| EVAL event_dataset = event.dataset::keyword, cpu_pct = system.cpu.total.norm.pct::double
+| WHERE event_dataset == "system.cpu" AND cpu_pct IS NOT NULL
 | RENAME host.hostname AS hostname.keyword
 | LOOKUP JOIN kibana_sdp_amdb ON hostname.keyword
 | MV_EXPAND group
 | WHERE group == "10008" AND alert_status == "enabled"
-| STATS avg_cpu = AVG(system.cpu.total.norm.pct) * 100 BY hostname.keyword, labels.client_code, labels.app_code
+| STATS avg_cpu = AVG(cpu_pct) * 100 BY hostname.keyword, labels.client_code, labels.app_code
 | WHERE avg_cpu > 98
 | EVAL current_value = ROUND(avg_cpu, 2)
 | DROP avg_cpu
@@ -83,9 +85,11 @@ FROM prod:metricbeat-*, prod:-metricbeat-7*
 ## The ENRICH variant
 
 ```esql
-FROM prod:metricbeat-*, prod:-metricbeat-7*
-| WHERE event.dataset == "system.cpu" AND @timestamp > NOW() - 5 minutes
-| STATS avg_cpu = AVG(system.cpu.total.norm.pct) * 100 BY host.hostname, labels.client_code, labels.app_code
+FROM prod:metricbeat-*
+| WHERE @timestamp > NOW() - 5 minutes
+| EVAL event_dataset = event.dataset::keyword, cpu_pct = system.cpu.total.norm.pct::double
+| WHERE event_dataset == "system.cpu" AND cpu_pct IS NOT NULL
+| STATS avg_cpu = AVG(cpu_pct) * 100 BY host.hostname, labels.client_code, labels.app_code
 | WHERE avg_cpu > 98
 | ENRICH _coordinator:kibana_sdp_amdb_policy ON host.hostname WITH group, alert_status
 | MV_EXPAND group
@@ -95,6 +99,41 @@ FROM prod:metricbeat-*, prod:-metricbeat-7*
 | DROP avg_cpu
 | LIMIT 10000
 ```
+
+## The multi-typed field problem, and why the casts are there
+
+Both queries cast `event.dataset` and `system.cpu.total.norm.pct` before using them. This is not
+defensive styling — without it the rule does not run. Over `prod:metricbeat-*` both fields are
+mapped with **conflicting types across indices**, so ES|QL resolves them to type `unsupported`,
+and then:
+
+- `event_dataset == "system.cpu"` fails with *"Invalid input types for `==`. Received
+  (unsupported, keyword)"*.
+- `AVG(system.cpu.total.norm.pct)` fails with *"Invalid input types for AVG. Received
+  (unsupported)"* — `AVG` only accepts `aggregate_metric_double`, `double`,
+  `exponential_histogram`, `integer` and `long`.
+
+This is the same root cause as the `verification_exception` Stage 1 has been failing with. An
+earlier revision here tried to fix it by excluding the legacy indices with
+`prod:-metricbeat-7*`; that was **not sufficient**, because the original error named three 7.x
+indices *"and [3] other indices"* whose names are not visible. Casting fixes it regardless of
+which indices conflict, which is why the exclusion has been dropped in favour of casts — the
+legacy indices are harmless now, and a 5-minute time filter skips them at the shard level
+anyway.
+
+Casting is the documented remedy for multi-typed fields ("union types"), and it works as long as
+the *only* reference to the raw field is the conversion itself — hence the raw names appear
+nowhere else in either query. You may still see a residual **warning** that the raw field
+"cannot be retrieved, it is unsupported or not indexed"; that refers to the uncast field and is
+expected. Warnings do not block; errors do.
+
+`cpu_pct IS NOT NULL` is not strictly required — `AVG` skips nulls — but it drops non-CPU
+documents before the join, which matters in the LOOKUP JOIN variant where the join runs on raw
+documents.
+
+`DIAGNOSTICS` has the `_field_caps` call that shows exactly which fields conflict and in which
+indices, plus what to do if `host.hostname` or the `labels.*` fields turn out to conflict too
+(they did not appear in the reported errors, so they are presumably consistent).
 
 `_coordinator` forces the enrich onto the local cluster, which is what makes this work with the
 policy only existing there. The trailing `RENAME` produces the same `hostname.keyword` column
@@ -260,6 +299,9 @@ Worth knowing before the cutover — none of these are bugs, but they are change
 - `10008_single_stage_enrich_variant` — the alternative rule that needs nothing on `prod`.
 - `kibana_sdp_amdb_enrich_policy` — the enrich policy that variant depends on, including the
   re-execution requirement. Only needed for the ENRICH variant.
+- `DIAGNOSTICS` — how to confirm each of the editor errors on your own cluster: the
+  `_field_caps` call that identifies mapping conflicts, the `index.mode` checks for local and
+  `prod`, and standalone `_query` calls that isolate the metricbeat half from the AMDB half.
 
 Pick one rule or the other; they emit the same event to the same connector, so running both
 enabled at once would double every ticket.
@@ -343,6 +385,29 @@ the action renderer (`renderMustacheObject` from the `actions` plugin) were bund
 The two defects this turned up — the `alarm_reason` float noise, and Stage 2's
 `.app_code.keyword` path rendering empty — were fixed before committing and the simulation
 re-run clean.
+
+**Kibana's own validator was later run against the rule** (`validateQuery` from
+`@kbn/esql-ast`, same 9.3 branch), which reproduced the three reported editor errors exactly,
+including the received types:
+
+```
+Line 2: Invalid input types for ==.  Received (unsupported, keyword)
+Line 4: "kibana_sdp_amdb" is not a valid JOIN index. Please use a "lookup" mode index.
+Line 7: Invalid input types for AVG. Received (unsupported)
+```
+
+Isolating them: lines 2 and 7 are caused solely by the two multi-typed fields, and adding the
+casts takes the LOOKUP JOIN rule from **2 errors to 0** under the identical harness. Line 4 is
+independent — it is emitted whenever the index is absent from the list Kibana fetched through
+its `getJoinIndices` callback, which is a check against Kibana's view of lookup-mode indices,
+not against the remote cluster.
+
+One validator gap worth knowing, since it affects the ENRICH variant: `validateQuery` does not
+add a policy's `enrich_fields` to its column list, so it reports `Unknown column "group"` after
+the `ENRICH` even when the policy resolves. Confirmed against Kibana's own test fixtures — a
+deliberately wrong policy name adds an `Unknown policy` error, so policy resolution works while
+the enrich columns are simply never registered. Treat that message as noise and rely on
+**Test query** / `POST _query`; `DIAGNOSTICS` has the calls.
 
 Still unverified, and only a live cluster can settle it:
 
