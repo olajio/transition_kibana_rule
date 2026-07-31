@@ -1,0 +1,292 @@
+{
+  "kibana_sdp_amdb": {
+    "aliases": {},
+    "mappings": {
+      "properties": {
+        "alert_status": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "app_code": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "client": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "datacenter": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "domain": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "event_type": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "group": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "hostname": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "maintanace": {
+          "properties": {
+            "sdp_ticket_id": {
+              "type": "long"
+            },
+            "utc_end": {
+              "type": "date"
+            },
+            "utc_start": {
+              "type": "date"
+            }
+          }
+        },
+        "node": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "os": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "query": {
+          "properties": {
+            "bool": {
+              "properties": {
+                "must_not": {
+                  "properties": {
+                    "range": {
+                      "properties": {
+                        "maintanace": {
+                          "properties": {
+                            "utc_end": {
+                              "properties": {
+                                "gte": {
+                                  "type": "text",
+                                  "fields": {
+                                    "keyword": {
+                                      "type": "keyword",
+                                      "ignore_above": 256
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "utc_start": {
+                              "properties": {
+                                "lte": {
+                                  "type": "text",
+                                  "fields": {
+                                    "keyword": {
+                                      "type": "keyword",
+                                      "ignore_above": 256
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "record": {
+          "properties": {
+            "created_by": {
+              "type": "keyword"
+            },
+            "created_timestamp": {
+              "type": "date"
+            },
+            "modified_by": {
+              "type": "keyword"
+            },
+            "modified_timestamp": {
+              "type": "date"
+            }
+          }
+        },
+        "script": {
+          "properties": {
+            "lang": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            },
+            "params": {
+              "properties": {
+                "group": {
+                  "type": "text",
+                  "fields": {
+                    "keyword": {
+                      "type": "keyword",
+                      "ignore_above": 256
+                    }
+                  }
+                },
+                "tag": {
+                  "type": "text",
+                  "fields": {
+                    "keyword": {
+                      "type": "keyword",
+                      "ignore_above": 256
+                    }
+                  }
+                }
+              }
+            },
+            "source": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            }
+          }
+        },
+        "svc-operator": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "svc-software-owner": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "svc_operator": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "svc_software_owner": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "target": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "type": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        }
+      }
+    },
+    "settings": {
+      "index": {
+        "mode": "lookup",
+        "routing": {
+          "allocation": {
+            "include": {
+              "_tier_preference": "data_hot"
+            }
+          }
+        },
+        "number_of_shards": "1",
+        "provided_name": "kibana_sdp_amdb",
+        "creation_date": "1761222452044",
+        "number_of_replicas": "1",
+        "uuid": "tv47TekPQM-n3Cf1qY3foQ",
+        "version": {
+          "created": "8536000"
+        }
+      }
+    }
+  }
+}
