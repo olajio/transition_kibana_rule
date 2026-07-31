@@ -9,6 +9,31 @@
 # Run this against the prod cluster, NOT the local/CCS cluster. The local
 # kibana_sdp_amdb stays exactly as it is; Stage 2 keeps using it until cutover.
 #
+# ##########################################################################
+# THE COPY MUST CONTAIN DATA. An empty index is worse than a missing one.
+# ##########################################################################
+#
+# Creating the index is only half the job. LOOKUP JOIN is a LEFT join, and every
+# data row in this query comes from prod, so every join is evaluated against
+# PROD's copy. The local copy is never consulted -- no local index appears in
+# the FROM, so the local cluster contributes no rows to join.
+#
+# If prod's copy exists but is empty:
+#   - every metric row matches nothing,
+#   - group and alert_status come back null,
+#   - "WHERE group == "10008" AND alert_status == "enabled"" drops every row
+#     (null comparisons are not true),
+#   - the rule runs GREEN and produces ZERO alerts, with no error anywhere.
+#
+# That is the dangerous failure: a missing index gets you a loud error (the one
+# the editor is already showing), an empty one gets you silence. Populate it,
+# then confirm with the Test query / _query calls in DIAGNOSTICS that rows come
+# back BEFORE enabling the rule.
+#
+# It needs the same documents as the local index -- one per host, carrying at
+# minimum hostname, group and alert_status. It does not need the other ~45 AMDB
+# fields, and it does not need to be in the same shape as anything else on prod.
+#
 # Mapping below is only the subset the rule actually reads. A lookup index does
 # not need the other ~45 fields of the full AMDB config, and keeping it narrow
 # means less to replicate and no chance of a field from this index shadowing a
@@ -62,6 +87,20 @@ PUT kibana_sdp_amdb
 # single-sharded.
 
 GET kibana_sdp_amdb/_settings?filter_path=**.mode,**.number_of_shards
+
+# And verify it is POPULATED (this is the check people skip). Must be non-zero:
+
+GET kibana_sdp_amdb/_count
+
+# Spot-check that the hostnames actually match what metricbeat reports, since a
+# join on a mismatched hostname convention (short name vs FQDN, case) silently
+# produces the same zero-alert result as an empty index:
+
+GET kibana_sdp_amdb/_search
+{
+  "size": 5,
+  "_source": ["hostname", "group", "alert_status"]
+}
 
 # --------------------------------------------------------------------------
 # Keeping it in sync
