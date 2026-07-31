@@ -226,6 +226,13 @@ execute it on the local cluster. Nothing on `prod`. Skip to point 3.
    shadowing a metricbeat column. Verify with `GET kibana_sdp_amdb/_settings` on `prod`;
    lookup-mode indices are always single-sharded.
 
+   **The copy must contain data, not just exist.** Every data row in this query comes from
+   `prod`, so every join is evaluated against *prod's* copy — the local one is never consulted,
+   because no local index appears in the `FROM`. An empty-but-present lookup index therefore
+   left-joins every row to nulls, `WHERE group == "10008" AND alert_status == "enabled"` drops
+   them all, and the rule runs green with **zero alerts and no error**. A missing index gives
+   you a loud error; an empty one gives you silence, which is worse.
+
 2. **Watch out for the silent-failure mode.** Remote clusters default to
    `skip_unavailable: true`, which means a cluster is marked `skipped` — rather than failing
    the query — when it *does not have the requested index*. If `kibana_sdp_amdb` is missing
@@ -397,10 +404,29 @@ Line 7: Invalid input types for AVG. Received (unsupported)
 ```
 
 Isolating them: lines 2 and 7 are caused solely by the two multi-typed fields, and adding the
-casts takes the LOOKUP JOIN rule from **2 errors to 0** under the identical harness. Line 4 is
-independent — it is emitted whenever the index is absent from the list Kibana fetched through
-its `getJoinIndices` callback, which is a check against Kibana's view of lookup-mode indices,
-not against the remote cluster.
+casts takes the LOOKUP JOIN rule from **2 errors to 0** under the identical harness.
+
+**Line 4 is accurate and independent — it is reporting that `kibana_sdp_amdb` is not a lookup
+index _on `prod`_.** An earlier revision of this file suggested it might be a false positive
+about the local index; that was wrong. Traced through the Kibana 9.3 source:
+
+```
+getJoinIndices(query)
+  -> getRemoteClustersFromESQLQuery(query)          => ["prod"]
+  -> GET /internal/esql/autocomplete/join/indices?remoteClusters=prod
+  -> EsqlService.getIndicesByIndexMode("lookup", "prod")
+       resolves index.mode=lookup over ["*", "prod:*"]
+  -> getListOfCCSIndices(["prod"], indices)
+       keeps only "cluster:index" entries for the listed clusters;
+       entries without a colon -- every LOCAL index -- are skipped outright
+```
+
+Once the query reads from a remote cluster, the editor's list of valid JOIN indices contains
+only lookup indices that exist **on that remote cluster**. The local copy is excluded by
+design, mirroring what Elasticsearch does: each cluster joins against its own copy. So a local
+`index.mode: lookup` — which is correctly set — cannot satisfy this check, and the error clears
+only when the index exists on `prod` (or when you switch to the ENRICH variant, which has no
+join-index check at all).
 
 One validator gap worth knowing, since it affects the ENRICH variant: `validateQuery` does not
 add a policy's `enrich_fields` to its column list, so it reports `Unknown column "group"` after

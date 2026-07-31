@@ -56,29 +56,41 @@ GET prod:metricbeat-*/_field_caps?fields=event.dataset,system.cpu.total.norm.pct
 # ==========================================================================
 # 2. Line 4: "kibana_sdp_amdb" is not a valid JOIN index
 # ==========================================================================
-# This message is emitted when the index is absent from the list Kibana fetched
-# via its getJoinIndices callback -- i.e. the lookup-mode indices Kibana can see
-# on the cluster it is connected to. It is a check against that list, not
-# against the remote cluster.
+# THIS ERROR IS ACCURATE. It is not about the local index, and it is not a false
+# positive. It is telling you the index is not a lookup index ON prod.
 #
-# Confirm the local index really is in lookup mode. This must return "lookup":
-
-GET kibana_sdp_amdb/_settings?filter_path=**.mode
-
-# If it returns nothing or "standard", that is the actual problem and it would
-# also mean Stage 2 could not be joining -- worth reconciling, since Stage 2's
-# last runs are recorded as succeeded.
+# The local index being index.mode: lookup is real and is not in question --
+# but for this query it is not the copy that matters, and Kibana deliberately
+# ignores it. Traced through Kibana 9.3:
 #
-# If it does return "lookup", the editor message is a false positive for this
-# editing context, BUT the query still cannot execute as-is, because the copy on
-# prod is what the join actually needs. Check prod separately:
+#   getJoinIndices(query)
+#     -> getRemoteClustersFromESQLQuery(query)         => ["prod"]   (from FROM prod:metricbeat-*)
+#     -> GET /internal/esql/autocomplete/join/indices?remoteClusters=prod
+#     -> EsqlService.getIndicesByIndexMode("lookup", "prod")
+#          resolves index.mode=lookup over ["*", "prod:*"]
+#     -> getListOfCCSIndices(["prod"], indices)
+#          keeps ONLY entries whose name is "cluster:index" for the listed
+#          clusters; entries with no colon -- i.e. every LOCAL index -- are
+#          skipped outright.
+#
+# So once the query reads from a remote cluster, the editor's list of valid JOIN
+# indices contains only lookup indices that exist ON THAT REMOTE CLUSTER. The
+# local kibana_sdp_amdb is excluded by design, because Elasticsearch would not
+# use it either: each cluster joins against its own copy.
+#
+# Confirm by running this AGAINST prod (not local). Empty response = the index
+# does not exist there, which is exactly what the editor is reporting:
 
-GET kibana_sdp_amdb/_settings?filter_path=**.mode     # <- run against prod
+GET kibana_sdp_amdb/_settings?filter_path=**.mode      # <-- run on prod
 
-# Missing there? Then either:
-#   - create it (kibana_sdp_amdb_prod_lookup_index), or
+# Fix it either way:
+#   - create AND POPULATE it on prod (kibana_sdp_amdb_prod_lookup_index), or
 #   - use the ENRICH variant (10008_single_stage_enrich_variant plus
 #     kibana_sdp_amdb_enrich_policy), which needs nothing on prod.
+#
+# For completeness, the local check (expected to return "lookup", and does):
+
+GET kibana_sdp_amdb/_settings?filter_path=**.mode      # <-- run on local
 
 # ==========================================================================
 # 3. Trust the server, not the editor
