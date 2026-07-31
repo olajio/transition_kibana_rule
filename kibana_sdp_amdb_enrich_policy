@@ -1,90 +1,35 @@
 # Enrich policy for the ENRICH variant of the consolidated rule
 # (10008_single_stage_enrich_variant).
 #
-# Run this on the LOCAL / CCS cluster -- the same cluster Kibana and
-# kibana_sdp_amdb already live on. Nothing is needed on prod: the rule uses
-# ENRICH _coordinator:, which forces the enrich to execute on the coordinating
-# (local) cluster, so the policy only has to exist here.
+# Run this on the LOCAL / CCS cluster -- the same cluster Kibana runs on. Nothing
+# is needed on prod: the rule uses ENRICH _coordinator:, which forces the enrich
+# to execute on the coordinating (local) cluster, so the policy only has to exist
+# here.
 #
-# ##########################################################################
-# WHY THIS IS NOT JUST "PUT policy ON kibana_sdp_amdb"
-# ##########################################################################
+# PREREQUISITE: kibana_sdp_amdb_enrich must already exist (keyword-mapped,
+# populated) on this cluster. Create it with kibana_sdp_amdb_enrich_index. This
+# file no longer creates its own throwaway reindex source -- kibana_sdp_amdb_enrich
+# is now the single source of truth you write to directly, so there is nothing
+# recurring to reindex.
 #
-# The obvious version -- match_field: "hostname.keyword" straight off
-# kibana_sdp_amdb -- fails at policy creation with:
-#
-#   "Could not traverse mapping to field [hostname.keyword].
-#    The [hostname] field must be regular object but was [text]."
-#
-# Two hard enrich constraints cause this, both confirmed in the 9.3 source:
-#
-# 1. Enrich validates match_field by splitting on "." and walking the mapping
-#    as OBJECT fields (EnrichPolicyRunner.validateAndGetMappingTypeAndFormat).
-#    In kibana_sdp_amdb, hostname is a `text` field with a `.keyword`
-#    MULTI-FIELD. A multi-field lives under "fields", not "properties", so the
-#    walk hits hostname, sees type=text (not object), and throws. Enrich simply
-#    cannot address a multi-field subfield as match_field -- unlike LOOKUP JOIN,
-#    which resolves hostname.keyword fine.
-#
-# 2. Even match_field: "hostname" (the bare text field) would be wrong: the
-#    enrich match processor issues a TermQuery against match_field
-#    (MatchProcessor.getQueryBuilder). A term query on an ANALYZED text field
-#    does not match a hostname like "CS01-10VLCNPY24" -- the analyzer has
-#    already split it into tokens ["cs01","10vlcnpy24"], so the whole-string
-#    term never matches. It would fail silently: zero enriched rows, zero
-#    alerts, no error.
-#
-# The fix for both: give enrich a source index where hostname (and the fields we
-# carry) are TOP-LEVEL keyword. kibana_sdp_amdb cannot be altered in place -- you
-# cannot change a field's type on an existing index -- so we reindex the three
-# fields we need into a small dedicated enrich source. The enrich source is a
-# plain index (it does NOT need index.mode: lookup; that requirement is only for
-# LOOKUP JOIN).
+# Why not build the policy straight on kibana_sdp_amdb?
+# ----------------------------------------------------
+# Because enrich cannot match on kibana_sdp_amdb's hostname. That field is `text`
+# with a `.keyword` multi-field, and enrich's match_field validation only walks
+# `object` fields (EnrichPolicyRunner.validateAndGetMappingTypeAndFormat), so it
+# throws "The [hostname] field must be regular object but was [text]". Nor can it
+# match the bare text field -- enrich matches with a TermQuery
+# (MatchProcessor.getQueryBuilder), which never matches an analyzed hostname
+# whole. kibana_sdp_amdb_enrich fixes this by mapping hostname as plain keyword.
 
 # --------------------------------------------------------------------------
-# Step 1: keyword-typed enrich source (local cluster)
+# 1. The policy, on the keyword source of truth
 # --------------------------------------------------------------------------
-PUT kibana_sdp_amdb_enrich
-{
-  "mappings": {
-    "properties": {
-      "hostname":     { "type": "keyword" },
-      "group":        { "type": "keyword" },
-      "alert_status": { "type": "keyword" }
-    }
-  }
-}
-
-# --------------------------------------------------------------------------
-# Step 2: copy the three fields across. The reindex reads _source, where
-# hostname/group/alert_status are the original string values (group is an array
-# -- keyword holds arrays fine, and the rule's MV_EXPAND still expands it). The
-# text -> keyword change happens because the destination mapping says keyword;
-# the stored value is unchanged.
-# --------------------------------------------------------------------------
-POST _reindex
-{
-  "source": {
-    "index": "kibana_sdp_amdb",
-    "_source": ["hostname", "group", "alert_status"]
-  },
-  "dest": { "index": "kibana_sdp_amdb_enrich" }
-}
-
-# Sanity check the copy before building the policy -- count should match
-# kibana_sdp_amdb, and hostname values should look like real hostnames (not
-# tokenized fragments):
-GET kibana_sdp_amdb_enrich/_count
-GET kibana_sdp_amdb_enrich/_search
-{ "size": 5, "_source": ["hostname", "group", "alert_status"] }
-
-# --------------------------------------------------------------------------
-# Step 3: the policy, now on the keyword source with a top-level match_field.
-# The rule matches this against host.hostname from metricbeat (already keyword),
-# so the types line up. enrich_fields is just the two fields the rule filters
-# on -- enrich adds its fields as new columns and same-named columns get
-# overwritten, so keeping the list narrow avoids shadowing a metricbeat column.
-# --------------------------------------------------------------------------
+# match_field is the top-level keyword `hostname`. The rule matches it against
+# host.hostname from metricbeat (already keyword), so the types line up.
+# enrich_fields is just the two fields the rule filters on -- enrich adds its
+# fields as new columns and same-named columns get overwritten, so keeping the
+# list narrow avoids shadowing a metricbeat column.
 PUT _enrich/policy/kibana_sdp_amdb_policy
 {
   "match": {
@@ -98,38 +43,31 @@ PUT _enrich/policy/kibana_sdp_amdb_policy
 }
 
 # --------------------------------------------------------------------------
-# Step 4: execute. An enrich policy is a POINT-IN-TIME SNAPSHOT -- it does
-# nothing until executed, and it does not track later changes to the source.
+# 2. Execute
 # --------------------------------------------------------------------------
 PUT _enrich/policy/kibana_sdp_amdb_policy/_execute
 
 # --------------------------------------------------------------------------
-# Keeping it current
+# Keeping it current -- the one thing the source-of-truth model does NOT remove
 # --------------------------------------------------------------------------
-# TWO things now have to be refreshed when AMDB config changes (a host added, or
-# an alert enabled/disabled for a host):
+# An enrich policy is a POINT-IN-TIME SNAPSHOT. _execute REINDEXES the source into
+# a separate hidden .enrich-* index (EnrichPolicyRunner, ~lines 479-508), and the
+# ENRICH command reads THAT, never the live source. So a record you add to or
+# delete from kibana_sdp_amdb_enrich has NO effect on the rule until you re-run:
 #
-#   1. re-run the _reindex above (Step 2) to refresh kibana_sdp_amdb_enrich, and
-#   2. re-run the _execute (Step 4) to rebuild the enrich index from it.
+#   PUT _enrich/policy/kibana_sdp_amdb_policy/_execute
 #
-# Until you do, the rule filters against config as it was at the last execute:
-# newly enabled hosts will not alert, newly disabled hosts will keep alerting.
-# Config changes rarely, so hourly/daily is plenty -- but wire both steps into
-# whatever maintains kibana_sdp_amdb, or schedule them; do not leave it manual.
+# Config changes rarely, so hourly/daily is plenty -- but wire the _execute into
+# whatever maintains kibana_sdp_amdb_enrich, or schedule it; do not leave it
+# manual. Until you do, newly enabled hosts will not alert and newly disabled
+# hosts will keep alerting.
 #
-# The reindex replaces documents by _id, so edits and additions propagate on a
-# refresh. DELETIONS do not -- a host removed from kibana_sdp_amdb lingers in
-# kibana_sdp_amdb_enrich. If hosts get retired from AMDB, recreate the enrich
-# source each cycle (DELETE kibana_sdp_amdb_enrich, then Steps 1-2) rather than
-# reindexing on top.
-#
-# This extra reindex step is the cost of the ENRICH route. The LOOKUP JOIN route
-# has no equivalent -- it reads kibana_sdp_amdb live and handles the .keyword
-# multi-field directly -- but it needs the populated copy on prod. Pick your
-# poison; see 10008_single_stage_README.md, "Two ways to do this on 9.3".
+# This snapshot behaviour is inherent to enrich. The only way to get truly-live
+# config (writes take effect immediately, no _execute) is the LOOKUP JOIN route
+# against the same kibana_sdp_amdb_enrich index -- see 10008_single_stage_enrich_index
+# -- which reads the index live. That route needs the index on prod instead.
 
 # Inspect / clean up:
 GET _enrich/policy/kibana_sdp_amdb_policy
 GET _enrich/_stats
-#   DELETE _enrich/policy/kibana_sdp_amdb_policy    # must delete policy before its source index
-#   DELETE kibana_sdp_amdb_enrich
+#   DELETE _enrich/policy/kibana_sdp_amdb_policy    # delete the policy before its source index
