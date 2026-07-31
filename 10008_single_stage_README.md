@@ -46,21 +46,33 @@ copy of the lookup index. So there are exactly two routes, and both are provided
 
 | | `10008_single_stage` (LOOKUP JOIN) | `10008_single_stage_enrich_variant` (ENRICH) |
 |---|---|---|
-| Needs on `prod` | `kibana_sdp_amdb` as a lookup-mode index | **nothing** |
-| Needs on local | nothing new | an enrich policy, executed |
-| Config freshness | **live** — reads the index every run | snapshot — stale until the policy is re-executed |
+| Needs on `prod` | `kibana_sdp_amdb` as a lookup-mode index, populated | **nothing** |
+| Needs on local | nothing new | a keyword-reindexed enrich source + policy, executed |
+| `hostname` handling | joins on the `.keyword` multi-field directly | needs a top-level `keyword` copy (reindex) |
+| Config freshness | **live** — reads the index every run | snapshot — stale until reindex + policy re-executed |
 | Join position | before `STATS`, on raw metric docs | after `STATS`, on breaching hosts only |
 | Work done | joins every metric doc in the window | joins a handful of rows |
 
 **Recommendation:** if you can get `kibana_sdp_amdb` onto `prod`, use the `LOOKUP JOIN` rule —
 it reads live config, which is the property the original design was chosen for ("your
 enrichment data changes frequently" is exactly the case for preferring `LOOKUP JOIN` over
-`ENRICH`). If you cannot, or not soon, the `ENRICH` variant is a genuine option that works
-today with no changes to `prod` at all, at the cost of having to re-execute the policy whenever
-AMDB config changes. Note the enrich route is also *cheaper*: because coordinator-mode `ENRICH`
-is not subject to the "no remote join after `STATS`" restriction, it can run after the
-aggregation and only enrich the breaching hosts, whereas the join has to run on every raw
-metric document in the window.
+`ENRICH`). If you cannot, or not soon, the `ENRICH` variant works today with no changes to
+`prod`, at the cost of a bit more local setup and a re-execute whenever AMDB config changes.
+
+One asymmetry, discovered the hard way (see `kibana_sdp_amdb_enrich_policy`): **enrich cannot
+match on `hostname.keyword`.** The index maps `hostname` as `text` with a `.keyword`
+multi-field, and enrich's `match_field` validation only walks `object` fields — it throws
+*"The [hostname] field must be regular object but was [text]"* on a multi-field subfield. Nor
+can it match on the bare `text` field, because enrich matches with a term query and an analyzed
+hostname never matches whole. So the ENRICH route requires reindexing the three needed fields
+into a small keyword-typed source first. **LOOKUP JOIN has no such limitation** — it resolves
+`hostname.keyword` directly — which is a genuine point in the join route's favour beyond the
+freshness argument.
+
+The enrich route is still *cheaper at query time*: because coordinator-mode `ENRICH` is not
+subject to the "no remote join after `STATS`" restriction, it runs after the aggregation and
+enriches only the breaching hosts, whereas the join runs on every raw metric document in the
+window.
 
 Both emit a byte-identical event and both were verified the same way (see below).
 
@@ -208,8 +220,11 @@ Line by line:
 
 ## Prerequisites before enabling
 
-**For the ENRICH variant:** just `kibana_sdp_amdb_enrich_policy` — create the policy and
-execute it on the local cluster. Nothing on `prod`. Skip to point 3.
+**For the ENRICH variant:** run `kibana_sdp_amdb_enrich_policy` on the local cluster. It is no
+longer a one-liner — enrich cannot match on the `hostname.keyword` multi-field (see the file for
+the full reason), so the steps are: reindex `hostname`/`group`/`alert_status` into a small
+keyword-typed source (`kibana_sdp_amdb_enrich`), create the policy on that source, and execute
+it. Nothing on `prod`. Skip to point 3.
 
 **For the LOOKUP JOIN rule:**
 
@@ -304,8 +319,9 @@ Worth knowing before the cutover — none of these are bugs, but they are change
 - `kibana_sdp_amdb_prod_lookup_index` — creates the lookup-mode copy on `prod`, with sync
   options and caveats. Only needed for the LOOKUP JOIN rule.
 - `10008_single_stage_enrich_variant` — the alternative rule that needs nothing on `prod`.
-- `kibana_sdp_amdb_enrich_policy` — the enrich policy that variant depends on, including the
-  re-execution requirement. Only needed for the ENRICH variant.
+- `kibana_sdp_amdb_enrich_policy` — the keyword reindex + enrich policy the variant depends on,
+  including why the multi-field forces the reindex and the re-execution requirement. Only needed
+  for the ENRICH variant.
 - `DIAGNOSTICS` — how to confirm each of the editor errors on your own cluster: the
   `_field_caps` call that identifies mapping conflicts, the `index.mode` checks for local and
   `prod`, and standalone `_query` calls that isolate the metricbeat half from the AMDB half.
