@@ -43,7 +43,7 @@ POST kbn:/api/alerting/rule/10ddef3e-4b27-49dc-ab82-41490dfe16da
     "thresholdComparator": ">",
     "size": 100,
     "esqlQuery": {
-      "esql": "FROM prod:metricbeat-*\n| WHERE @timestamp > NOW() - 5 minutes\n| EVAL event_dataset = event.dataset::keyword, cpu_pct = system.cpu.total.norm.pct::double\n| WHERE event_dataset == \"system.cpu\" AND cpu_pct IS NOT NULL\n| RENAME host.hostname AS hostname\n| LOOKUP JOIN kibana_sdp_amdb_enrich ON hostname\n| MV_EXPAND group\n| WHERE group == \"10008\" AND alert_status == \"enabled\"\n| STATS avg_cpu = AVG(cpu_pct) * 100 BY hostname, labels.client_code, labels.app_code\n| WHERE avg_cpu > 98\n| EVAL current_value = ROUND(avg_cpu, 2)\n| DROP avg_cpu\n| LIMIT 10000\n"
+      "esql": "FROM prod:metricbeat-*\n| WHERE @timestamp > NOW() - 5 minutes\n| EVAL event_dataset = event.dataset::keyword,\n       cpu_pct       = system.cpu.total.norm.pct::double,\n       hostname      = host.hostname::keyword,\n       client_code   = labels.client_code::keyword,\n       app_code      = labels.app_code::keyword\n| WHERE event_dataset == \"system.cpu\" AND cpu_pct IS NOT NULL\n| LOOKUP JOIN kibana_sdp_amdb_enrich ON hostname\n| MV_EXPAND group\n| WHERE group == \"10008\" AND alert_status == \"enabled\"\n| STATS avg_cpu = AVG(cpu_pct) * 100 BY hostname, client_code, app_code\n| WHERE avg_cpu > 98\n| EVAL current_value = ROUND(avg_cpu, 2)\n| RENAME client_code AS labels.client_code, app_code AS labels.app_code\n| DROP avg_cpu\n| LIMIT 10000\n"
     },
     "aggType": "count",
     "groupBy": "row",

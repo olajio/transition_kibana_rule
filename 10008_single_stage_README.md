@@ -106,20 +106,25 @@ for LOOKUP JOIN and `10008_single_stage_enrich_variant` + `kibana_sdp_amdb_enric
 ENRICH. The original `10008_single_stage` still works against the unmodified `text`+`.keyword`
 `kibana_sdp_amdb` if you would rather not migrate the index at all.
 
-## The consolidated query (LOOKUP JOIN)
+## The consolidated query (LOOKUP JOIN, original `kibana_sdp_amdb`)
 
 ```esql
 FROM prod:metricbeat-*
 | WHERE @timestamp > NOW() - 5 minutes
-| EVAL event_dataset = event.dataset::keyword, cpu_pct = system.cpu.total.norm.pct::double
+| EVAL event_dataset = event.dataset::keyword,
+       cpu_pct       = system.cpu.total.norm.pct::double,
+       hk            = host.hostname::keyword,
+       client_code   = labels.client_code::keyword,
+       app_code      = labels.app_code::keyword
 | WHERE event_dataset == "system.cpu" AND cpu_pct IS NOT NULL
-| RENAME host.hostname AS hostname.keyword
+| RENAME hk AS hostname.keyword
 | LOOKUP JOIN kibana_sdp_amdb ON hostname.keyword
 | MV_EXPAND group
 | WHERE group == "10008" AND alert_status == "enabled"
-| STATS avg_cpu = AVG(cpu_pct) * 100 BY hostname.keyword, labels.client_code, labels.app_code
+| STATS avg_cpu = AVG(cpu_pct) * 100 BY hostname.keyword, client_code, app_code
 | WHERE avg_cpu > 98
 | EVAL current_value = ROUND(avg_cpu, 2)
+| RENAME client_code AS labels.client_code, app_code AS labels.app_code
 | DROP avg_cpu
 | LIMIT 10000
 ```
@@ -129,31 +134,70 @@ FROM prod:metricbeat-*
 ```esql
 FROM prod:metricbeat-*
 | WHERE @timestamp > NOW() - 5 minutes
-| EVAL event_dataset = event.dataset::keyword, cpu_pct = system.cpu.total.norm.pct::double
+| EVAL event_dataset = event.dataset::keyword,
+       cpu_pct       = system.cpu.total.norm.pct::double,
+       hostname      = host.hostname::keyword,
+       client_code   = labels.client_code::keyword,
+       app_code      = labels.app_code::keyword
 | WHERE event_dataset == "system.cpu" AND cpu_pct IS NOT NULL
-| STATS avg_cpu = AVG(cpu_pct) * 100 BY host.hostname, labels.client_code, labels.app_code
+| STATS avg_cpu = AVG(cpu_pct) * 100 BY hostname, client_code, app_code
 | WHERE avg_cpu > 98
-| ENRICH _coordinator:kibana_sdp_amdb_policy ON host.hostname WITH group, alert_status
+| ENRICH _coordinator:kibana_sdp_amdb_policy ON hostname WITH group, alert_status
 | MV_EXPAND group
 | WHERE group == "10008" AND alert_status == "enabled"
 | EVAL current_value = ROUND(avg_cpu, 2)
-| RENAME host.hostname AS hostname.keyword
+| RENAME hostname    AS hostname.keyword,
+         client_code AS labels.client_code,
+         app_code    AS labels.app_code
+| DROP avg_cpu
+| LIMIT 10000
+```
+
+## The LOOKUP JOIN variant against `kibana_sdp_amdb_enrich`
+
+```esql
+FROM prod:metricbeat-*
+| WHERE @timestamp > NOW() - 5 minutes
+| EVAL event_dataset = event.dataset::keyword,
+       cpu_pct       = system.cpu.total.norm.pct::double,
+       hostname      = host.hostname::keyword,
+       client_code   = labels.client_code::keyword,
+       app_code      = labels.app_code::keyword
+| WHERE event_dataset == "system.cpu" AND cpu_pct IS NOT NULL
+| LOOKUP JOIN kibana_sdp_amdb_enrich ON hostname
+| MV_EXPAND group
+| WHERE group == "10008" AND alert_status == "enabled"
+| STATS avg_cpu = AVG(cpu_pct) * 100 BY hostname, client_code, app_code
+| WHERE avg_cpu > 98
+| EVAL current_value = ROUND(avg_cpu, 2)
+| RENAME client_code AS labels.client_code, app_code AS labels.app_code
 | DROP avg_cpu
 | LIMIT 10000
 ```
 
 ## The multi-typed field problem, and why the casts are there
 
-Both queries cast `event.dataset` and `system.cpu.total.norm.pct` before using them. This is not
-defensive styling — without it the rule does not run. Over `prod:metricbeat-*` both fields are
-mapped with **conflicting types across indices**, so ES|QL resolves them to type `unsupported`,
-and then:
+Every query casts **five** metricbeat fields at the top with an `EVAL` block:
 
-- `event_dataset == "system.cpu"` fails with *"Invalid input types for `==`. Received
-  (unsupported, keyword)"*.
-- `AVG(system.cpu.total.norm.pct)` fails with *"Invalid input types for AVG. Received
-  (unsupported)"* — `AVG` only accepts `aggregate_metric_double`, `double`,
-  `exponential_histogram`, `integer` and `long`.
+- `event.dataset` → `event_dataset` (keyword)
+- `system.cpu.total.norm.pct` → `cpu_pct` (double)
+- `host.hostname` → `hostname` (keyword) *[or `hk` renamed to `hostname.keyword` in the original LOOKUP JOIN variant that joins on the multi-field]*
+- `labels.client_code` → `client_code` (keyword)
+- `labels.app_code` → `app_code` (keyword)
+
+This is not defensive styling — without it the rule does not run. Over `prod:metricbeat-*` all
+five are mapped with **conflicting types across indices**, so ES|QL resolves each to type
+`unsupported` and produces a runtime error like:
+
+```
+Cannot use field [host.hostname] due to ambiguities being mapped as
+[2] incompatible types: [keyword] in [prod:.ds-metricbeat-8.11.0-…] and [301] other indices,
+[text] in [prod:metricbeat-7.17.21] and [5] other indices.
+```
+
+The same shape rejects `==`, `AVG`, `STATS ... BY`, `RENAME`, and `LOOKUP JOIN ON` — the fields
+are simply unusable in their raw form. `AVG` in particular only accepts numeric types
+(`aggregate_metric_double`, `double`, `exponential_histogram`, `integer`, `long`).
 
 This is the same root cause as the `verification_exception` Stage 1 has been failing with. An
 earlier revision here tried to fix it by excluding the legacy indices with
@@ -163,11 +207,21 @@ which indices conflict, which is why the exclusion has been dropped in favour of
 legacy indices are harmless now, and a 5-minute time filter skips them at the shard level
 anyway.
 
+**These errors surface one at a time**, not all at once. Elasticsearch validates fields in the
+order they're referenced, so fixing `event.dataset` and `cpu_pct` alone lets the query progress
+until it hits `host.hostname` in the next command, and so on. The full cast block up front short-
+circuits that game of whack-a-mole. If any *other* field is added to a future revision of the
+query, check `_field_caps` for it first — see `DIAGNOSTICS`.
+
 Casting is the documented remedy for multi-typed fields ("union types"), and it works as long as
 the *only* reference to the raw field is the conversion itself — hence the raw names appear
-nowhere else in either query. You may still see a residual **warning** that the raw field
-"cannot be retrieved, it is unsupported or not indexed"; that refers to the uncast field and is
+nowhere else in any query. You may still see a residual **warning** that the raw field "cannot
+be retrieved, it is unsupported or not indexed"; that refers to the uncast field and is
 expected. Warnings do not block; errors do.
+
+The trailing `RENAME` (in every variant) puts the columns back under the dotted names the action
+template expects (`labels.client_code`, `labels.app_code`, and in most cases `hostname.keyword`),
+so the emitted event is unchanged.
 
 `cpu_pct IS NOT NULL` is not strictly required — `AVG` skips nulls — but it drops non-CPU
 documents before the join, which matters in the LOOKUP JOIN variant where the join runs on raw
